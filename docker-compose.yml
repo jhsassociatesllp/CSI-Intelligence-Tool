@@ -5,9 +5,9 @@ services:
     ports:
       - "${APP_PORT}:9040"
     environment:
-      - APP_PORT=9040
-    env_file:
-      - .env
+      - "${APP_PORT}:9040"
+      - MONGO_URI=${MONGO_URI}
+      - SECRET_KEY=${SECRET_KEY}
     restart: always
     volumes:
       - ./uploads:/app/uploads

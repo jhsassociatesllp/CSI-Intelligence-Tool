@@ -58,6 +58,10 @@ jobs:
             docker images | grep compliance_app | awk '{print $3}' | xargs -r docker rmi -f
 
             echo "🚀 Starting fresh containers"
-            APP_PORT=$PORT docker compose up -d --build --force-recreate
+
+            APP_PORT=$PORT \
+            MONGO_URI=${{ secrets.MONGO_URI }} \
+            SECRET_KEY=${{ secrets.SECRET_KEY }} \
+            docker compose up -d --build --force-recreate
 
             echo "✅ Deployment completed"
