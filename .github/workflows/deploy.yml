@@ -61,3 +61,4 @@ jobs:
             APP_PORT=$PORT docker compose up -d --build
 
             echo "✅ Deployment completed"
+            
