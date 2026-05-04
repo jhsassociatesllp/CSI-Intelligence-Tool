@@ -6,8 +6,8 @@ services:
       - "${APP_PORT}:9040"
     environment:
       - "${APP_PORT}:9040"
-      - MONGO_URI=${MONGO_URI}
-      - SECRET_KEY=${SECRET_KEY}
+      - MONGODB_URL=${MONGODB_URL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
     restart: always
     volumes:
       - ./uploads:/app/uploads

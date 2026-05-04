@@ -60,8 +60,8 @@ jobs:
             echo "🚀 Starting fresh containers"
 
             APP_PORT=$PORT \
-            MONGO_URI=${{ secrets.MONGO_URI }} \
-            SECRET_KEY=${{ secrets.SECRET_KEY }} \
+            MONGODB_URL=${{ secrets.MONGODB_URL }} \
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }} \
             docker compose up -d --build --force-recreate
 
             echo "✅ Deployment completed"
