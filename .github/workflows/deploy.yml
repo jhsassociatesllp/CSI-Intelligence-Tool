@@ -1,0 +1,63 @@
+name: 🚀 Deploy to Server
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v0.1.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          port: ${{ secrets.SERVER_PORT }}
+          script: |
+            set -e
+
+            BRANCH="${{ github.ref_name }}"
+
+            echo "🌿 Branch: $BRANCH"
+
+            if [ "$BRANCH" = "main" ]; then
+              PORT=9040
+              ENV=production
+            elif [ "$BRANCH" = "staging" ]; then
+              PORT=9041
+              ENV=staging
+            else
+              echo "Unsupported branch: $BRANCH"
+              exit 1
+            fi
+
+            echo "🌍 ENV: $ENV"
+            echo "🔌 PORT: $PORT"
+
+            APP_DIR="/www/wwwroot/compliance-automation"
+
+            # Clone if not exists
+            if [ ! -d "$APP_DIR" ]; then
+              git clone https://github.com/YOUR_REPO.git $APP_DIR
+            fi
+
+            cd $APP_DIR
+
+            git fetch --all
+            git reset --hard origin/$BRANCH
+
+            echo "🛑 Stopping old containers"
+            docker compose down --remove-orphans
+
+            echo "🧹 Removing old images (only this project)"
+            docker images | grep compliance_app | awk '{print $3}' | xargs -r docker rmi -f
+
+            echo "🚀 Starting fresh containers"
+            APP_PORT=$PORT docker compose up -d --build
+
+            echo "✅ Deployment completed"

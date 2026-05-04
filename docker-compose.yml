@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  compliance-app:
+    build: .
+    container_name: compliance_app
+    ports:
+      - "${APP_PORT}:${APP_PORT}"
+    env_file:
+      - .env
+    environment:
+      - APP_PORT=${APP_PORT}
+    restart: always
+    volumes:
+      - ./uploads:/app/uploads
