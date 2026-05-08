@@ -440,10 +440,6 @@ tbody td { padding: 12px 14px; font-size: 13px; vertical-align: middle; }
   border-top-color: var(--navy);
 }
 @keyframes spin { to { transform: rotate(360deg); } }
-@keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(1.15)} }
-@keyframes chatBubblePop { 0%{transform:scale(0);opacity:0} 100%{transform:scale(1);opacity:1} }
-@keyframes chatPanelOpen { 0%{opacity:0;transform:translateY(12px)} 100%{opacity:1;transform:translateY(0)} }
-@keyframes typingDot { 0%,80%,100%{opacity:.2;transform:scale(.8)} 40%{opacity:1;transform:scale(1)} }
 
 .loading-overlay {
   display: flex;

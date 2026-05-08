@@ -1,955 +1,890 @@
 """
-CSI Intelligence - Compliance Signals Intelligence Backend
-JHS & Associates LLP
+CSI Intelligence — Compliance Signals Intelligence Backend
+JHS & Associates LLP — Agentic Pipeline v2.0
+8 Specialist Agents (all gpt-4o) + Real-Time SSE Streaming
 """
-
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from openai import AsyncOpenAI
 from bson import ObjectId
 from bson.errors import InvalidId
-import os
-import json
-import shutil
+import os, json, shutil, asyncio
 from dotenv import load_dotenv
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, AsyncGenerator
 import logging
 
 load_dotenv()
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────
-# App Setup
-# ─────────────────────────────────────────────────────────
-app = FastAPI(title="CSI Intelligence API", version="1.0.0")
+# ── App & DB ──────────────────────────────────────────────
+app = FastAPI(title="CSI Intelligence API", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ─────────────────────────────────────────────────────────
-# Database
-# ─────────────────────────────────────────────────────────
-MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
-mongo_client = AsyncIOMotorClient(MONGODB_URL)
-db = mongo_client.csi_intelligence
-
-# ─────────────────────────────────────────────────────────
-# OpenAI
-# ─────────────────────────────────────────────────────────
+MONGODB_URL    = os.getenv("MONGODB_URL",   "mongodb://localhost:27017")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-UPLOAD_DIR = "uploads"
+mongo_client   = AsyncIOMotorClient(MONGODB_URL)
+db             = mongo_client.csi_intelligence
+openai_client  = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+UPLOAD_DIR     = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ─────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────
-def serialize(doc: dict) -> dict:
-    """Convert MongoDB _id to string."""
-    if doc is None:
-        return None
+# ── Utilities ─────────────────────────────────────────────
+def serialize(doc):
+    if doc is None: return None
     doc = dict(doc)
-    if "_id" in doc:
-        doc["_id"] = str(doc["_id"])
+    if "_id" in doc: doc["_id"] = str(doc["_id"])
     return doc
 
+def to_object_id(id_str):
+    try: return ObjectId(id_str)
+    except: raise HTTPException(status_code=400, detail=f"Invalid ID: {id_str}")
 
-def to_object_id(id_str: str) -> ObjectId:
-    try:
-        return ObjectId(id_str)
-    except (InvalidId, Exception):
-        raise HTTPException(status_code=400, detail=f"Invalid ID: {id_str}")
-
-
-async def call_gpt(system_prompt: str, user_prompt: str, max_tokens: int = 2000) -> dict:
-    """Central OpenAI call — returns parsed JSON dict."""
+# ── GPT helpers (all gpt-4o) ──────────────────────────────
+async def call_gpt(system_prompt, user_prompt, max_tokens=2000):
     if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured. Add OPENAI_API_KEY to .env file.")
-    
-    response = await openai_client.chat.completions.create(
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+    r = await openai_client.chat.completions.create(
         model="gpt-4o",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.3,
-        max_tokens=max_tokens,
-        response_format={"type": "json_object"},
-    )
-    
-    content = response.choices[0].message.content
-    return json.loads(content)
+        messages=[{"role":"system","content":system_prompt},
+                  {"role":"user","content":user_prompt}],
+        temperature=0.3, max_tokens=max_tokens,
+        response_format={"type":"json_object"})
+    return json.loads(r.choices[0].message.content)
 
-
-import re as _re
-
-async def research_company_web(company_name: str, industry: str) -> str:
-    """Step 1 of 11-step framework: Web-search real regulatory actions for a company.
-    Uses gpt-4o-search-preview if available, returns raw research text."""
-    if not OPENAI_API_KEY:
-        return ""
+async def web_search(query, context_size="high"):
+    if not OPENAI_API_KEY: return "[No API key]"
     try:
-        response = await openai_client.chat.completions.create(
+        r = await openai_client.chat.completions.create(
             model="gpt-4o-search-preview",
-            web_search_options={"search_context_size": "high"},
-            messages=[{
-                "role": "user",
-                "content": f"""You are a compliance research analyst. Search the web and find ALL publicly available instances of regulatory actions, penalties, enforcement orders, show-cause notices, or adverse regulatory observations for {company_name} (industry: {industry}) in India.
-
-Search these sources exhaustively:
-- RBI website (rbi.org.in) — press releases, penalty orders, directions under Banking Regulation Act / RBI Act
-- SEBI website (sebi.gov.in) — enforcement orders, adjudication orders, circular violations, settlement orders
-- MCA / ROC portals (mca.gov.in) — compounding orders, striking off actions, director disqualifications
-- BSE (bseindia.com) / NSE (nseindia.com) — exchange filings, disclosure violations
-- IRDAI (irdai.gov.in), PFRDA (pfrda.org.in) — if applicable
-- Income Tax / GST authorities — demand orders, penalties
-- News sources: Business Standard, Economic Times, Moneycontrol, Mint, LiveMint, Bloomberg Quint, Financial Express
-
-For each incident, provide:
-1. Exact date
-2. Nature of non-compliance
-3. Regulatory authority
-4. Penalty / action taken (with amount if any)
-5. **EXACT SOURCE URL** (direct link to the RBI/SEBI/MCA press release, or news article)
-6. Brief description of business impact
-7. Whether it is a repeat violation
-
-Format as a numbered list. Be thorough — include even minor penalty actions."""
-            }],
-            max_tokens=3000,
-        )
-        return response.choices[0].message.content or ""
+            web_search_options={"search_context_size": context_size},
+            messages=[{"role":"user","content":query}],
+            max_tokens=3000)
+        return r.choices[0].message.content or ""
     except Exception as e:
-        logger.warning(f"Web search step skipped (model may not be available): {e}")
-        return ""
+        logger.warning(f"Web search unavailable: {e}")
+        return f"[Web search unavailable — {str(e)[:120]}]"
 
+# ── SSE emitters ──────────────────────────────────────────
+async def emit(q, agent_id, status, message, detail="", findings=None):
+    ev = {"type":"agent_update","agent_id":agent_id,"status":status,
+          "message":message,"detail":detail,
+          "timestamp":datetime.utcnow().strftime("%H:%M:%S")}
+    if findings is not None: ev["findings"] = findings
+    await q.put(ev); await asyncio.sleep(0.06)
 
-def extract_json_from_text(text: str) -> dict:
-    """Extract JSON object from GPT response text (handles markdown fences)."""
-    # Strip markdown code fences
-    text = text.strip()
-    if text.startswith("```"):
-        text = _re.sub(r"^```[a-z]*\n?", "", text)
-        text = _re.sub(r"\n?```$", "", text)
-    # Find the outermost JSON object
-    match = _re.search(r"\{[\s\S]*\}", text)
-    if match:
-        return json.loads(match.group())
-    return json.loads(text)
+async def log(q, text):
+    await q.put({"type":"log","text":text,
+                 "timestamp":datetime.utcnow().strftime("%H:%M:%S")})
+    await asyncio.sleep(0.04)
 
+# ════════════════════════════════════════════════════════
+# AGENT 1 — ORCHESTRATOR (gpt-4o)
+# ════════════════════════════════════════════════════════
+async def agent_orchestrator(company, items, q):
+    await emit(q,"orchestrator","running","Reading company profile & compliance records",
+               f"{company['name']} · {company.get('industry','N/A')}")
+    await log(q, f"Orchestrator: Profiling {company['name']} — {len(items)} internal items found")
 
-# ─────────────────────────────────────────────────────────
-# Pydantic Models
-# ─────────────────────────────────────────────────────────
-class CompanyCreate(BaseModel):
-    name: str
-    industry: str
-    cin: Optional[str] = ""
-    pan: Optional[str] = ""
-    competitors: List[str] = []
-    description: Optional[str] = ""
-    listing_status: Optional[str] = "Listed"  # Listed / Unlisted
+    sample_json = json.dumps(
+        [{"title":i.get("title"),"status":i.get("status"),"framework":i.get("framework","")}
+         for i in items[:8]], default=str)
 
+    sys_ = "You are the orchestrator agent of a compliance AI pipeline. Create a focused research plan. JSON only."
+    usr  = f"""Company: {company['name']}
+Industry: {company.get('industry','N/A')} | CIN: {company.get('cin','N/A')}
+Listing: {company.get('listing_status','Unknown')} | Competitors: {', '.join(company.get('competitors',[]))}
+Internal items count: {len(items)}
+Sample: {sample_json}
 
-class ComplianceItemCreate(BaseModel):
-    company_id: str
-    category: str  # Companies Act 2013 | SEBI LODR | SEBI ICDR | FEMA/RBI | Income Tax/GST
-    sub_category: Optional[str] = ""
-    title: str
-    description: Optional[str] = ""
-    due_date: str  # ISO date string
-    status: str = "pending"  # compliant | pending | non-compliant
-    priority: str = "medium"  # high | medium | low
-    responsible_person: Optional[str] = ""
-    section_reference: Optional[str] = ""  # e.g. "Section 137 of Companies Act"
-    notes: Optional[str] = ""
-
-
-# ─────────────────────────────────────────────────────────
-# DASHBOARD
-# ─────────────────────────────────────────────────────────
-@app.get("/api/dashboard")
-async def get_dashboard(company_id: Optional[str] = Query(None)):
-    query = {}
-    if company_id:
-        query["company_id"] = company_id
-
-    total_companies = await db.companies.count_documents({})
-    total_items = await db.compliance.count_documents(query)
-    compliant = await db.compliance.count_documents({**query, "status": "compliant"})
-    pending = await db.compliance.count_documents({**query, "status": "pending"})
-    non_compliant = await db.compliance.count_documents({**query, "status": "non-compliant"})
-    total_docs = await db.documents.count_documents(query)
-
-    # Category breakdown for chart
-    categories: dict = {}
-    async for item in db.compliance.find(query):
-        cat = item.get("category", "Other")
-        status = item.get("status", "pending")
-        if cat not in categories:
-            categories[cat] = {"compliant": 0, "pending": 0, "non-compliant": 0, "total": 0}
-        categories[cat][status] = categories[cat].get(status, 0) + 1
-        categories[cat]["total"] += 1
-
-    # Upcoming deadlines (next 30 days)
-    from datetime import timedelta
-    now = datetime.utcnow()
-    upcoming = []
-    async for item in db.compliance.find({**query, "status": {"$ne": "compliant"}}):
-        due = item.get("due_date", "")
-        if due:
-            try:
-                due_dt = datetime.fromisoformat(due)
-                days_left = (due_dt - now).days
-                if 0 <= days_left <= 30:
-                    item_data = serialize(item)
-                    item_data["days_left"] = days_left
-                    upcoming.append(item_data)
-            except Exception:
-                pass
-    upcoming.sort(key=lambda x: x.get("days_left", 999))
-
-    return {
-        "total_companies": total_companies,
-        "total_items": total_items,
-        "compliant": compliant,
-        "pending": pending,
-        "non_compliant": non_compliant,
-        "total_documents": total_docs,
-        "categories": categories,
-        "upcoming_deadlines": upcoming[:5],
-    }
-
-
-# ─────────────────────────────────────────────────────────
-# COMPANIES
-# ─────────────────────────────────────────────────────────
-@app.get("/api/companies")
-async def list_companies():
-    companies = []
-    async for c in db.companies.find().sort("name", 1):
-        companies.append(serialize(c))
-    return companies
-
-
-@app.post("/api/companies", status_code=201)
-async def create_company(company: CompanyCreate):
-    doc = {**company.model_dump(), "created_at": datetime.utcnow().isoformat()}
-    result = await db.companies.insert_one(doc)
-    created = await db.companies.find_one({"_id": result.inserted_id})
-    return serialize(created)
-
-
-@app.get("/api/companies/{company_id}")
-async def get_company(company_id: str):
-    company = await db.companies.find_one({"_id": to_object_id(company_id)})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-    return serialize(company)
-
-
-@app.put("/api/companies/{company_id}")
-async def update_company(company_id: str, company: CompanyCreate):
-    await db.companies.update_one(
-        {"_id": to_object_id(company_id)},
-        {"$set": {**company.model_dump(), "updated_at": datetime.utcnow().isoformat()}},
-    )
-    updated = await db.companies.find_one({"_id": to_object_id(company_id)})
-    return serialize(updated)
-
-
-@app.delete("/api/companies/{company_id}")
-async def delete_company(company_id: str):
-    await db.companies.delete_one({"_id": to_object_id(company_id)})
-    return {"message": "Company deleted successfully"}
-
-
-# ─────────────────────────────────────────────────────────
-# COMPLIANCE MAPPING
-# ─────────────────────────────────────────────────────────
-@app.get("/api/compliance")
-async def list_compliance(company_id: Optional[str] = Query(None)):
-    query = {}
-    if company_id:
-        query["company_id"] = company_id
-    items = []
-    async for item in db.compliance.find(query).sort("due_date", 1):
-        items.append(serialize(item))
-    return items
-
-
-@app.post("/api/compliance", status_code=201)
-async def create_compliance(item: ComplianceItemCreate):
-    doc = {**item.model_dump(), "created_at": datetime.utcnow().isoformat()}
-    result = await db.compliance.insert_one(doc)
-    created = await db.compliance.find_one({"_id": result.inserted_id})
-    return serialize(created)
-
-
-@app.put("/api/compliance/{item_id}")
-async def update_compliance(item_id: str, item: ComplianceItemCreate):
-    await db.compliance.update_one(
-        {"_id": to_object_id(item_id)},
-        {"$set": {**item.model_dump(), "updated_at": datetime.utcnow().isoformat()}},
-    )
-    updated = await db.compliance.find_one({"_id": to_object_id(item_id)})
-    return serialize(updated)
-
-
-@app.delete("/api/compliance/{item_id}")
-async def delete_compliance(item_id: str):
-    await db.compliance.delete_one({"_id": to_object_id(item_id)})
-    return {"message": "Item deleted"}
-
-
-# Seed common Indian compliance deadlines
-@app.post("/api/compliance/seed/{company_id}")
-async def seed_compliance(company_id: str):
-    """Seed common Indian statutory compliance items for a company."""
-    company = await db.companies.find_one({"_id": to_object_id(company_id)})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    from datetime import date
-    today = date.today()
-    year = today.year
-
-    items = [
-        # Companies Act 2013
-        {"category": "Companies Act 2013", "sub_category": "Annual Filing", "title": "Filing of Annual Return (MGT-7A)", "section_reference": "Section 92", "due_date": f"{year}-11-29", "priority": "high"},
-        {"category": "Companies Act 2013", "sub_category": "Annual Filing", "title": "Filing of Financial Statements (AOC-4)", "section_reference": "Section 137", "due_date": f"{year}-10-29", "priority": "high"},
-        {"category": "Companies Act 2013", "sub_category": "Board Meeting", "title": "Q1 Board Meeting (Apr-Jun)", "section_reference": "Section 173", "due_date": f"{year}-08-14", "priority": "medium"},
-        {"category": "Companies Act 2013", "sub_category": "Board Meeting", "title": "Q2 Board Meeting (Jul-Sep)", "section_reference": "Section 173", "due_date": f"{year}-11-14", "priority": "medium"},
-        {"category": "Companies Act 2013", "sub_category": "AGM", "title": "Annual General Meeting", "section_reference": "Section 96", "due_date": f"{year}-09-30", "priority": "high"},
-        {"category": "Companies Act 2013", "sub_category": "Audit", "title": "Statutory Audit Completion", "section_reference": "Section 143", "due_date": f"{year}-09-30", "priority": "high"},
-        {"category": "Companies Act 2013", "sub_category": "Secretarial Audit", "title": "Secretarial Audit Report (MR-3)", "section_reference": "Section 204", "due_date": f"{year}-09-30", "priority": "medium"},
-
-        # SEBI LODR
-        {"category": "SEBI LODR", "sub_category": "Quarterly Results", "title": "Q1 Financial Results Disclosure", "section_reference": "Reg 33", "due_date": f"{year}-07-31", "priority": "high"},
-        {"category": "SEBI LODR", "sub_category": "Quarterly Results", "title": "Q2 Financial Results Disclosure", "section_reference": "Reg 33", "due_date": f"{year}-10-31", "priority": "high"},
-        {"category": "SEBI LODR", "sub_category": "Quarterly Results", "title": "Q3 Financial Results Disclosure", "section_reference": "Reg 33", "due_date": f"{year+1}-01-31", "priority": "high"},
-        {"category": "SEBI LODR", "sub_category": "Annual", "title": "Annual Report Filing with Stock Exchange", "section_reference": "Reg 34", "due_date": f"{year}-09-30", "priority": "high"},
-        {"category": "SEBI LODR", "sub_category": "Corporate Governance", "title": "Q1 Corporate Governance Report", "section_reference": "Reg 27", "due_date": f"{year}-07-21", "priority": "medium"},
-        {"category": "SEBI LODR", "sub_category": "Related Party", "title": "Half-Yearly RPT Disclosure", "section_reference": "Reg 23", "due_date": f"{year}-10-31", "priority": "high"},
-        {"category": "SEBI LODR", "sub_category": "Shareholding", "title": "Q1 Shareholding Pattern", "section_reference": "Reg 31", "due_date": f"{year}-07-21", "priority": "medium"},
-
-        # Income Tax / GST
-        {"category": "Income Tax/GST", "sub_category": "GST", "title": "GSTR-1 Monthly Filing (Apr)", "section_reference": "Section 37 CGST", "due_date": f"{year}-05-11", "priority": "high"},
-        {"category": "Income Tax/GST", "sub_category": "GST", "title": "GSTR-3B Monthly Filing (Apr)", "section_reference": "Section 39 CGST", "due_date": f"{year}-05-20", "priority": "high"},
-        {"category": "Income Tax/GST", "sub_category": "Income Tax", "title": "Advance Tax Q1 (15%)", "section_reference": "Section 208", "due_date": f"{year}-06-15", "priority": "high"},
-        {"category": "Income Tax/GST", "sub_category": "Income Tax", "title": "Advance Tax Q2 (45%)", "section_reference": "Section 208", "due_date": f"{year}-09-15", "priority": "high"},
-        {"category": "Income Tax/GST", "sub_category": "Income Tax", "title": "Advance Tax Q3 (75%)", "section_reference": "Section 208", "due_date": f"{year}-12-15", "priority": "high"},
-        {"category": "Income Tax/GST", "sub_category": "Income Tax", "title": "Corporate Tax Return Filing", "section_reference": "Section 139", "due_date": f"{year}-10-31", "priority": "high"},
-        {"category": "Income Tax/GST", "sub_category": "TDS", "title": "TDS Q1 Return (Form 24Q/26Q)", "section_reference": "Section 200", "due_date": f"{year}-07-31", "priority": "medium"},
-
-        # FEMA/RBI
-        {"category": "FEMA/RBI", "sub_category": "FDI", "title": "Annual Return on Foreign Liabilities & Assets (FLA)", "section_reference": "FEMA 20R", "due_date": f"{year}-07-15", "priority": "high"},
-        {"category": "FEMA/RBI", "sub_category": "ECB", "title": "ECB Monthly Return (ECB-2)", "section_reference": "FEMA 3R", "due_date": f"{year}-07-07", "priority": "medium"},
-    ]
-
-    inserted = 0
-    for item in items:
-        doc = {
-            "company_id": company_id,
-            "status": "pending",
-            "description": f"Statutory obligation under {item.get('section_reference', '')}",
-            "responsible_person": "",
-            "notes": "",
-            "created_at": datetime.utcnow().isoformat(),
-            **item,
-        }
-        await db.compliance.insert_one(doc)
-        inserted += 1
-
-    return {"message": f"Seeded {inserted} compliance items", "count": inserted}
-
-
-# ─────────────────────────────────────────────────────────
-# AI ANALYSIS
-# ─────────────────────────────────────────────────────────
-@app.post("/api/analysis")
-async def run_analysis(data: dict):
-    company_id = data.get("company_id")
-    if not company_id:
-        raise HTTPException(status_code=400, detail="company_id is required")
-
-    company = await db.companies.find_one({"_id": to_object_id(company_id)})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    # Gather internal compliance data (from app's own database)
-    items = []
-    async for item in db.compliance.find({"company_id": company_id}):
-        items.append(serialize(item))
-    compliance_json = json.dumps(items, indent=2, default=str) if items else "No internal compliance items recorded yet."
-
-    # ─── STEP 1: Web research (11-step framework Phase 2) ───────────────────
-    logger.info(f"[Analysis] Step 1 — Web research for {company['name']}")
-    web_research = await research_company_web(company["name"], company.get("industry", "General"))
-    research_section = f"\n\nWEB RESEARCH FINDINGS (from live regulatory sources):\n{web_research}" if web_research else ""
-
-    # ─── STEP 2: Structure into 11-step framework JSON ──────────────────────
-    logger.info(f"[Analysis] Step 2 — Structuring analysis for {company['name']}")
-
-    system_prompt = """You are a senior compliance and risk analyst at JHS & Associates LLP following the 11-Step Compliance Planning Framework.
-
-Your analysis must be:
-- FACTUAL: Based on real regulatory actions from RBI, SEBI, MCA, IRDAI, Income Tax, GST authorities
-- SOURCED: Every incident must have real source URLs (RBI press releases, SEBI orders, BSE filings, news articles)
-- PRECISE: Cite exact section numbers, sub-sections, rule numbers, penalty provisions
-- STRUCTURED: Follow the 9-field extraction template per incident
-- ANALYTICAL: Identify repeat patterns, systemic weaknesses, and key risk themes
-
-CRITICAL: For source URLs, use real known URLs:
-- RBI press releases: https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx?prid=XXXXX
-- SEBI orders: https://www.sebi.gov.in/enforcement/orders/...
-- MCA: https://www.mca.gov.in/...
-- BSE filings: https://www.bseindia.com/xml-data/corpfiling/AttachLive/...
-- News: actual article URLs from Business Standard, ET, Mint etc.
-
-If a URL is not precisely known, provide the base regulatory portal URL and mark the source as [approximate URL].
-Respond with valid JSON only — no markdown, no preamble."""
-
-    user_prompt = f"""Perform a comprehensive compliance risk analysis for {company["name"]}
-(Industry: {company.get("industry","N/A")} | CIN: {company.get("cin","N/A")} | {company.get("listing_status","Listed")})
-
-INTERNAL COMPLIANCE RECORDS:
-{compliance_json}
-{research_section}
-
-Following the 11-Step Compliance Planning Framework, return a JSON with EXACTLY these keys:
-
+Return JSON:
 {{
-  "risk_level": "High|Medium|Low",
-  "overall_score": <0-100 compliance health score>,
-  "risk_summary": "<2-3 sentence executive overview>",
-  "total_incidents": <number>,
-  "data_sources_searched": ["RBI Press Releases", "SEBI Orders", "BSE Filings", "MCA Portal", "News Archives"],
+  "primary_regulators": ["most relevant e.g. RBI, SEBI, MCA, IRDAI, IT Dept, GST"],
+  "risk_areas": ["specific risk areas based on industry"],
+  "rbi_mca_focus": "2-sentence search focus for RBI/MCA researcher",
+  "sebi_exchange_focus": "2-sentence search focus for SEBI/Exchange researcher",
+  "tax_media_focus": "2-sentence search focus for Tax & News researcher",
+  "key_themes": ["compliance themes to watch"]
+}}"""
 
-  "incident_log": [
+    try:
+        plan = await call_gpt(sys_, usr, max_tokens=800)
+        regs = ", ".join(plan.get("primary_regulators",[])[:4])
+        await emit(q,"orchestrator","done",
+                   f"Research plan ready · {len(plan.get('risk_areas',[]))} risk areas",
+                   f"Regulators in scope: {regs}")
+        await log(q, f"Orchestrator: Plan complete — regulators: {regs}")
+        return plan
+    except Exception as e:
+        await emit(q,"orchestrator","error",f"Planning failed: {str(e)[:80]}")
+        return {"rbi_mca_focus":f"regulatory penalties against {company['name']}",
+                "sebi_exchange_focus":f"SEBI orders for {company['name']}",
+                "tax_media_focus":f"tax and news coverage of {company['name']}",
+                "primary_regulators":["RBI","SEBI","MCA"]}
+
+# ════════════════════════════════════════════════════════
+# AGENT 2a — RBI & MCA RESEARCHER (web_search)
+# ════════════════════════════════════════════════════════
+async def agent_researcher_rbi(company, plan, q):
+    name  = company["name"]
+    focus = plan.get("rbi_mca_focus", f"regulatory penalties against {name}")
+    await emit(q,"researcher_rbi","running","Searching RBI press releases & MCA orders",
+               "Querying rbi.org.in · mca.gov.in · Parliamentary disclosures")
+    await log(q, f"RBI/MCA Researcher: Searching — {focus[:80]}...")
+
+    query = f"""Find ALL regulatory enforcement actions by RBI and MCA against {name} (India).
+Search: rbi.org.in penalty orders, Section 47A/35A directions, Banking Regulation Act violations;
+mca.gov.in compounding orders, director disqualifications, NCLT orders;
+Parliamentary Lok Sabha/Rajya Sabha replies mentioning {name} and penalties; FEMA/Enforcement Directorate orders.
+Focus: {focus} | Time: January 2019 to present.
+For each: exact date · regulation violated · penalty amount/action · direct source URL · business impact. Be exhaustive."""
+
+    result = await web_search(query)
+    lines  = len([l for l in result.split("\n") if l.strip()])
+    await emit(q,"researcher_rbi","done",f"RBI & MCA research complete · {lines} data points",
+               "Covered penalty orders, compounding, NCLT, parliamentary disclosures", findings=lines)
+    await log(q, f"RBI/MCA Researcher: Done — {lines} data points collected")
+    return result
+
+# ════════════════════════════════════════════════════════
+# AGENT 2b — SEBI & EXCHANGE RESEARCHER (web_search)
+# ════════════════════════════════════════════════════════
+async def agent_researcher_sebi(company, plan, q):
+    name  = company["name"]
+    focus = plan.get("sebi_exchange_focus", f"SEBI enforcement for {name}")
+    await emit(q,"researcher_sebi","running","Searching SEBI orders & exchange filings",
+               "Querying sebi.gov.in · bseindia.com · nseindia.com")
+    await log(q, f"SEBI Researcher: Scanning enforcement orders & LODR filings for {name}...")
+
+    query = f"""Find ALL SEBI and stock exchange regulatory actions against {name} (India).
+Search: sebi.gov.in adjudication orders, settlement orders, enforcement actions, show-cause notices;
+bseindia.com disclosure violations, listing compliance notices; nseindia.com trading notices;
+SEBI LODR violations (Reg 33 results, Reg 23 RPT, Reg 9 insider trading);
+SEBI ICDR violations — IPO/rights issue compliance.
+Focus: {focus} | Time: January 2019 to present.
+For each: date · SEBI Regulation number · penalty/action · direct URL · case/order number."""
+
+    result = await web_search(query)
+    lines  = len([l for l in result.split("\n") if l.strip()])
+    await emit(q,"researcher_sebi","done",f"SEBI & Exchange research complete · {lines} data points",
+               "Covered adjudication orders, LODR filings, exchange notices", findings=lines)
+    await log(q, f"SEBI Researcher: Done — {lines} data points collected")
+    return result
+
+# ════════════════════════════════════════════════════════
+# AGENT 2c — TAX & MEDIA RESEARCHER (web_search)
+# ════════════════════════════════════════════════════════
+async def agent_researcher_tax(company, plan, q):
+    name     = company["name"]
+    industry = company.get("industry","")
+    focus    = plan.get("tax_media_focus", f"tax and news coverage of {name}")
+    await emit(q,"researcher_tax","running","Searching tax authorities & financial media",
+               "Querying IT Dept · GST · FEMA · Business Standard · Economic Times")
+    await log(q, f"Tax/Media Researcher: Scanning IT, GST, FEMA, and press archives for {name}...")
+
+    query = f"""Find compliance violations and news for {name} ({industry}, India).
+Search: Income Tax demand orders, TDS defaults Section 200/271, ITAT orders;
+GST/CGST penalty orders, ITC disputes, AAR rulings;
+Enforcement Directorate FEMA violation orders, forex penalties;
+Financial media (Business Standard, Economic Times, Mint, Moneycontrol, LiveMint) — search "{name} penalty" "{name} violation" "{name} regulatory action" "{name} notice".
+Focus: {focus} | Time: January 2019 to present.
+For each: date · authority · violation · penalty amount · direct article/order URL."""
+
+    result = await web_search(query)
+    lines  = len([l for l in result.split("\n") if l.strip()])
+    await emit(q,"researcher_tax","done",f"Tax & Media research complete · {lines} data points",
+               "Covered Income Tax, GST, FEMA, financial press archives", findings=lines)
+    await log(q, f"Tax/Media Researcher: Done — {lines} data points collected")
+    return result
+
+# ════════════════════════════════════════════════════════
+# AGENT 3 — DATA EXTRACTOR (gpt-4o)
+# ════════════════════════════════════════════════════════
+async def agent_extractor(company, rbi, sebi, tax, q):
+    await emit(q,"extractor","running","Structuring raw research into 9-field incident data",
+               "Applying 11-Step Compliance Planning Framework extraction template")
+    await log(q,"Extractor: Processing raw research from all 3 researchers...")
+
+    combined = f"=== RBI & MCA ===\n{rbi}\n\n=== SEBI & EXCHANGE ===\n{sebi}\n\n=== TAX & MEDIA ===\n{tax}"
+    sys_ = ("You are a data extractor following the 11-Step Compliance Planning Framework. "
+            "Extract each non-compliance incident into the mandatory 9-field format. "
+            "Use REAL URLs from the research — never fabricate. Mark inferred root causes. Deduplicate. JSON only.")
+    usr  = f"""Extract all compliance incidents for {company['name']} from this research:
+{combined}
+
+Return JSON:
+{{
+  "total_found": <number>,
+  "incidents": [
     {{
       "id": 1,
-      "date": "<date of incident/report e.g. Oct 17, 2023>",
-      "nature": "<specific nature of non-compliance>",
-      "regulator": "<regulatory authority e.g. RBI, SEBI, MCA, IT Dept, GST>",
-      "penalty_action": "<exact penalty/action e.g. ₹3.95 crore under Section 47A(1)(c)>",
-      "business_implication": "<financial, operational, or reputational impact>",
-      "root_cause": "<explicit or inferred root cause>",
-      "root_cause_inferred": true,
-      "classification": "Regulatory|Governance|Financial|ESG",
-      "severity": "High|Medium|Low",
-      "severity_rationale": "<reason for severity rating>",
+      "date": "<date>",
+      "nature": "<specific non-compliance>",
+      "regulator": "<RBI|SEBI|MCA|IT Dept|GST|FEMA|IRDAI|Exchange>",
+      "penalty_action": "<exact penalty/action>",
+      "business_implication": "<financial, operational, reputational impact>",
+      "root_cause": "<explicit or inferred reason>",
+      "root_cause_inferred": <true|false>,
+      "classification": "<Regulatory|Governance|Financial|ESG>",
+      "severity": "<High|Medium|Low>",
+      "severity_rationale": "<rationale>",
       "legal_section": "<primary section e.g. Section 47A(1)(c) Banking Regulation Act 1949>",
       "sources": [
         {{
-          "title": "<e.g. RBI Press Release Oct 17 2023>",
-          "url": "<actual URL>",
-          "type": "Official|Filing|Media",
-          "url_approximate": false
+          "title": "<source title e.g. RBI Press Release Oct 2023>",
+          "url": "<real URL from research>",
+          "type": "<Official|Filing|Media>",
+          "url_approximate": <false if exact, true if base URL only>
         }}
       ]
-    }}
-  ],
-
-  "repeat_violations": [
-    {{
-      "violation": "<type of violation>",
-      "first_occurrence": "<date/case reference>",
-      "recurrence": "<date/case reference>",
-      "pattern_analysis": "<why it keeps recurring>"
-    }}
-  ],
-
-  "systemic_weaknesses": [
-    {{
-      "area": "<control/governance area>",
-      "weakness": "<specific systemic gap identified>",
-      "related_incident_ids": [1, 2]
-    }}
-  ],
-
-  "key_risk_themes": [
-    {{
-      "rank": 1,
-      "theme": "<theme title>",
-      "description": "<detailed description>",
-      "related_incident_ids": [1, 3]
-    }}
-  ],
-
-  "early_warning_signals": [
-    {{
-      "signal": "<warning sign>",
-      "area": "<area>",
-      "recommended_action": "<specific action>",
-      "timeline": "<urgency>",
-      "legal_references": [
-        {{
-          "citation": "<exact section/rule/regulation>",
-          "description": "<what it requires>",
-          "url": "<regulatory portal URL for this provision>"
-        }}
-      ]
-    }}
-  ],
-
-  "regulatory_priorities": [
-    {{
-      "rank": 1,
-      "action": "<priority action>",
-      "framework": "<framework>",
-      "deadline": "<date>",
-      "owner": "<suggested owner>",
-      "legal_reference": "<exact section/regulation>",
-      "reference_url": "<URL to the relevant regulation/circular>"
-    }}
-  ],
-
-  "strengths": ["<strength 1>", "<strength 2>"],
-
-  "recommendations": [
-    {{
-      "category": "<category>",
-      "recommendation": "<detailed recommendation>",
-      "priority": "Immediate|Short-term|Long-term",
-      "legal_basis": "<exact sections/regulations>",
-      "reference_url": "<URL to MCA/SEBI/RBI guidance>"
     }}
   ]
 }}"""
 
+    await log(q,"Extractor: Running 9-field extraction on combined research data...")
     try:
-        result_data = await call_gpt(system_prompt, user_prompt, max_tokens=5000)
+        result = await call_gpt(sys_, usr, max_tokens=5000)
+        n = result.get("total_found", len(result.get("incidents",[])))
+        await emit(q,"extractor","done",f"Extracted {n} incidents with sources",
+                   "9-field structure complete · sources mapped", findings=n)
+        await log(q, f"Extractor: {n} unique incidents extracted and structured")
+        return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI analysis failed: {str(e)}")
+        await emit(q,"extractor","error",f"Extraction failed: {str(e)[:80]}")
+        await log(q, f"Extractor ERROR: {str(e)[:120]}")
+        return {"total_found":0,"incidents":[]}
 
-    doc = {
-        "company_id": company_id,
-        "company_name": company["name"],
-        "analysis": result_data,
-        "items_analyzed": len(items),
-        "web_research_used": bool(web_research),
-        "framework_version": "11-Step Compliance Planning Framework v1.0",
-        "created_at": datetime.utcnow().isoformat(),
-    }
-    await db.analyses.insert_one(doc)
-    doc_copy = dict(doc)
-    if "_id" in doc_copy:
-        doc_copy["_id"] = str(doc_copy["_id"])
-    return doc_copy
+# ════════════════════════════════════════════════════════
+# AGENT 4 — VERIFIER & FACT-CHECKER (gpt-4o)
+# ════════════════════════════════════════════════════════
+async def agent_verifier(company, extracted, q):
+    incidents = extracted.get("incidents",[])
+    await emit(q,"verifier","running",f"Fact-checking {len(incidents)} incidents",
+               "Verifying section numbers · penalty amounts · URL validity")
+    await log(q, f"Verifier: Cross-checking {len(incidents)} incidents for accuracy...")
+    if not incidents:
+        await emit(q,"verifier","done","No incidents to verify","")
+        return extracted
 
+    sys_ = ("You are the verifier agent — a senior compliance reviewer at JHS & Associates LLP. "
+            "Quality-check: verify section numbers, flag logical errors, assign confidence scores, expand citations. JSON only.")
+    usr  = f"""Verify compliance incidents for {company['name']}:
+{json.dumps(incidents, indent=2, default=str)}
+
+Check: Is legal_section specific enough? Is penalty consistent with violation? Is severity defensible?
+Return JSON:
+{{
+  "verified_incidents": [
+    {{
+      ...all original fields...,
+      "confidence_score": <0-100>,
+      "verification_notes": "<corrections or concerns>",
+      "legal_section_full": "<fully expanded citation: Act + Section + Sub-section + Rule>"
+    }}
+  ],
+  "verification_summary": {{
+    "total_verified": <n>, "high_confidence": <n with score>=80>,
+    "flagged": <n with score<60>, "corrections_made": <n>
+  }}
+}}"""
+
+    await log(q,"Verifier: Validating legal citations and cross-checking penalty provisions...")
+    try:
+        result = await call_gpt(sys_, usr, max_tokens=5000)
+        s  = result.get("verification_summary",{})
+        v  = s.get("total_verified", len(result.get("verified_incidents",[])))
+        hc = s.get("high_confidence",0)
+        fl = s.get("flagged",0)
+        cr = s.get("corrections_made",0)
+        await emit(q,"verifier","done",f"{v} verified · {hc} high-confidence",
+                   f"{fl} flagged · {cr} corrections applied")
+        await log(q, f"Verifier: {v} incidents verified, {hc} high-confidence, {cr} corrections")
+        return result
+    except Exception as e:
+        await emit(q,"verifier","error",f"Verification failed: {str(e)[:80]}")
+        await log(q, f"Verifier ERROR: {str(e)[:120]}")
+        return extracted
+
+# ════════════════════════════════════════════════════════
+# AGENT 5 — PATTERN ANALYST (gpt-4o)
+# ════════════════════════════════════════════════════════
+async def agent_analyst(company, verified, items, q):
+    incidents = verified.get("verified_incidents", verified.get("incidents",[]))
+    await emit(q,"analyst","running",f"Detecting patterns across {len(incidents)} incidents",
+               "Identifying repeat violations · systemic weaknesses · risk themes")
+    await log(q, f"Analyst: Running pattern detection on {len(incidents)} verified incidents...")
+
+    internal_summary = json.dumps(
+        [{"title":i.get("title"),"status":i.get("status"),"framework":i.get("framework","")}
+         for i in items[:15]], default=str)
+
+    sys_ = ("You are the pattern analysis agent — specialist in systemic compliance risk at JHS & Associates LLP. "
+            "Identify patterns that individual incident review misses. JSON only.")
+    usr  = f"""Analyze verified compliance incidents for {company['name']}:
+INCIDENTS: {json.dumps(incidents[:20], indent=2, default=str)}
+INTERNAL COMPLIANCE: {internal_summary}
+
+Return JSON:
+{{
+  "risk_level": "High|Medium|Low",
+  "overall_score": <0-100 higher=healthier>,
+  "risk_summary": "<3-4 sentence executive summary of compliance posture>",
+  "repeat_violations": [
+    {{"violation":"<type>","first_occurrence":"<date/ref>","recurrence":"<date/ref>","frequency":"<how many times>","pattern_analysis":"<root cause of recurrence>"}}
+  ],
+  "systemic_weaknesses": [
+    {{"area":"<e.g. IT Risk, Vendor Oversight, Loan Ops>","weakness":"<specific control gap>","evidence":"<which incidents>","related_incident_ids":[1,2]}}
+  ],
+  "key_risk_themes": [
+    {{"rank":1,"theme":"<title>","description":"<2-3 sentences on significance>","related_incident_ids":[1,3],"trend":"Improving|Stable|Worsening"}}
+  ],
+  "early_warning_signals": [
+    {{"signal":"<forward-looking warning>","area":"<area>","recommended_action":"<specific action>","timeline":"<urgency>",
+      "legal_references":[{{"citation":"<exact section/rule>","description":"<what it requires>","url":"<regulatory URL>"}}]}}
+  ],
+  "strengths": ["<genuine compliance strength 1>","<strength 2>"]
+}}"""
+
+    await log(q,"Analyst: Mapping repeat violations and systemic control weaknesses...")
+    try:
+        result = await call_gpt(sys_, usr, max_tokens=3000)
+        t = len(result.get("key_risk_themes",[]))
+        r = len(result.get("repeat_violations",[]))
+        w = len(result.get("systemic_weaknesses",[]))
+        await emit(q,"analyst","done",f"{t} risk themes · {r} repeat patterns · {w} systemic weaknesses",
+                   f"Overall risk: {result.get('risk_level','?')} · Score: {result.get('overall_score','?')}/100")
+        await log(q, f"Analyst: {t} themes, {r} repeat patterns, {w} systemic weaknesses identified")
+        return result
+    except Exception as e:
+        await emit(q,"analyst","error",f"Analysis failed: {str(e)[:80]}")
+        await log(q, f"Analyst ERROR: {str(e)[:120]}")
+        return {"risk_level":"Unknown","overall_score":0,"risk_summary":"Analysis incomplete",
+                "repeat_violations":[],"systemic_weaknesses":[],"key_risk_themes":[],
+                "early_warning_signals":[],"strengths":[]}
+
+# ════════════════════════════════════════════════════════
+# AGENT 6 — REPORT WRITER (gpt-4o)
+# ════════════════════════════════════════════════════════
+async def agent_reporter(company, verified, analysis, q):
+    incidents = verified.get("verified_incidents", verified.get("incidents",[]))
+    await emit(q,"reporter","running","Compiling final board-ready compliance report",
+               "Writing regulatory priorities · recommendations · action plan")
+    await log(q,"Reporter: Writing regulatory priorities and JHS recommendations...")
+
+    sys_ = "You are the report writing agent at JHS & Associates LLP. Compile all agent findings into the final structured report. JSON only."
+    usr  = f"""Compile final compliance report for {company['name']}.
+VERIFIED INCIDENTS ({len(incidents)}): {json.dumps(incidents[:15], indent=2, default=str)}
+PATTERN ANALYSIS: {json.dumps(analysis, indent=2, default=str)}
+
+Return complete JSON:
+{{
+  "risk_level": "{analysis.get('risk_level','Medium')}",
+  "overall_score": {analysis.get('overall_score',50)},
+  "risk_summary": <from analysis — 3-4 sentences>,
+  "total_incidents": {len(incidents)},
+  "data_sources_searched": ["RBI Press Releases","SEBI Orders","BSE/NSE Filings","MCA Portal","Income Tax Records","GST Authority","FEMA/ED Orders","Financial Media"],
+  "incident_log": <verified incidents array — all fields intact>,
+  "repeat_violations": <from analysis>,
+  "systemic_weaknesses": <from analysis>,
+  "key_risk_themes": <from analysis>,
+  "early_warning_signals": <from analysis>,
+  "strengths": <from analysis>,
+  "regulatory_priorities": [
+    {{"rank":1,"action":"<specific urgent action>","framework":"<framework>","deadline":"<date or timeframe>",
+      "owner":"<Board|MD|CFO|Company Secretary|Legal Team>","legal_reference":"<exact section/regulation>","reference_url":"<URL>"}}
+  ],
+  "recommendations": [
+    {{"category":"<e.g. IT Governance, Vendor Management>","recommendation":"<detailed specific recommendation>",
+      "priority":"Immediate|Short-term|Long-term","legal_basis":"<exact sections>","reference_url":"<URL>"}}
+  ]
+}}"""
+
+    await log(q,"Reporter: Finalising report structure and cross-linking all findings...")
+    try:
+        result = await call_gpt(sys_, usr, max_tokens=5000)
+        if not result.get("incident_log") and incidents:
+            result["incident_log"] = incidents
+        for k in ["repeat_violations","systemic_weaknesses","key_risk_themes","early_warning_signals","strengths"]:
+            if not result.get(k) and analysis.get(k):
+                result[k] = analysis[k]
+        recs = len(result.get("recommendations",[]))
+        pris = len(result.get("regulatory_priorities",[]))
+        await emit(q,"reporter","done",f"Report complete · {recs} recommendations · {pris} priorities",
+                   "Board-ready compliance report compiled")
+        await log(q, f"Reporter: Done — {len(incidents)} incidents, {recs} recs, {pris} priorities")
+        return result
+    except Exception as e:
+        await emit(q,"reporter","error",f"Report generation failed: {str(e)[:80]}")
+        await log(q, f"Reporter ERROR: {str(e)[:120]}")
+        return {**analysis,"incident_log":incidents,"total_incidents":len(incidents),
+                "data_sources_searched":["RBI","SEBI","MCA","Media"],
+                "regulatory_priorities":[],"recommendations":[]}
+
+# ════════════════════════════════════════════════════════
+# MASTER PIPELINE — 8 agents, all gpt-4o, always fresh
+# ════════════════════════════════════════════════════════
+async def run_agent_pipeline(company, items, q):
+    try:
+        company_id     = str(company["_id"])
+        company["_id"] = company_id
+        await log(q, f"Pipeline started for {company['name']} at {datetime.utcnow().strftime('%H:%M:%S')} UTC")
+
+        # Agent 1: Orchestrator
+        plan = await agent_orchestrator(company, items, q)
+
+        # Agents 2a/b/c: Parallel researchers
+        await log(q,"Launching 3 research agents in parallel...")
+        results   = await asyncio.gather(
+            agent_researcher_rbi(company, plan, q),
+            agent_researcher_sebi(company, plan, q),
+            agent_researcher_tax(company, plan, q),
+            return_exceptions=True)
+        rbi_data  = results[0] if not isinstance(results[0], Exception) else ""
+        sebi_data = results[1] if not isinstance(results[1], Exception) else ""
+        tax_data  = results[2] if not isinstance(results[2], Exception) else ""
+        await log(q,"All 3 researchers done — consolidating findings...")
+
+        # Agent 3: Extractor
+        extracted = await agent_extractor(company, rbi_data, sebi_data, tax_data, q)
+
+        # Agent 4: Verifier
+        verified  = await agent_verifier(company, extracted, q)
+
+        # Agent 5: Analyst
+        analysis  = await agent_analyst(company, verified, items, q)
+
+        # Agent 6: Reporter
+        final     = await agent_reporter(company, verified, analysis, q)
+
+        # Persist to MongoDB (no cache — always a fresh document)
+        doc = {"company_id":company_id,"company_name":company["name"],
+               "analysis":final,"items_analyzed":len(items),"web_research_used":True,
+               "framework_version":"11-Step CPF v2.0 — 8-Agent gpt-4o Pipeline",
+               "pipeline_agents":["orchestrator","researcher_rbi","researcher_sebi",
+                                   "researcher_tax","extractor","verifier","analyst","reporter"],
+               "created_at":datetime.utcnow().isoformat()}
+        res        = await db.analyses.insert_one(doc)
+        doc["_id"] = str(res.inserted_id)
+        await log(q, f"Analysis saved — DB ID: {doc['_id']}")
+        await q.put({"type":"complete","data":doc,
+                     "timestamp":datetime.utcnow().strftime("%H:%M:%S")})
+
+    except Exception as e:
+        logger.error(f"Pipeline error: {e}", exc_info=True)
+        await log(q, f"PIPELINE ERROR: {str(e)}")
+        await q.put({"type":"error","message":str(e),
+                     "timestamp":datetime.utcnow().strftime("%H:%M:%S")})
+
+# ── SSE Endpoint ──────────────────────────────────────────
+@app.get("/api/analysis/stream")
+async def stream_analysis(company_id: str):
+    company = await db.companies.find_one({"_id": to_object_id(company_id)})
+    if not company: raise HTTPException(status_code=404, detail="Company not found")
+    items = []
+    async for item in db.compliance.find({"company_id": company_id}):
+        items.append(serialize(item))
+    q: asyncio.Queue = asyncio.Queue()
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        task = asyncio.create_task(run_agent_pipeline(company, items, q))
+        try:
+            while True:
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=300.0)
+                    yield f"data: {json.dumps(ev, default=str)}\n\n"
+                    if ev.get("type") in ("complete","error"): break
+                except asyncio.TimeoutError:
+                    yield f"data: {json.dumps({'type':'error','message':'Pipeline timed out after 5 minutes'})}\n\n"
+                    break
+        finally:
+            if not task.done(): task.cancel()
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream",
+        headers={"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"})
 
 @app.get("/api/analysis")
 async def list_analyses(company_id: Optional[str] = Query(None)):
     query = {}
-    if company_id:
-        query["company_id"] = company_id
+    if company_id: query["company_id"] = company_id
     results = []
-    async for item in db.analyses.find(query).sort("created_at", -1).limit(10):
+    async for item in db.analyses.find(query).sort("created_at",-1).limit(10):
         results.append(serialize(item))
     return results
 
-
 # ─────────────────────────────────────────────────────────
-# EXECUTIVE SUMMARY
+# AI CHAT ASSISTANT (gpt-4o)
 # ─────────────────────────────────────────────────────────
-@app.post("/api/summary")
-async def generate_summary(data: dict):
-    company_id = data.get("company_id")
-    if not company_id:
-        raise HTTPException(status_code=400, detail="company_id is required")
+@app.post("/api/chat")
+async def chat_with_analyst(data: dict):
+    message      = data.get("message","").strip()
+    analysis     = data.get("analysis",{})
+    history      = data.get("history",[])
+    company_name = data.get("company_name","the company")
 
-    company = await db.companies.find_one({"_id": to_object_id(company_id)})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
 
-    items = []
-    async for item in db.compliance.find({"company_id": company_id}):
-        items.append(serialize(item))
+    incidents_summary = json.dumps(
+        [{"id":i+1,"nature":inc.get("nature",""),"regulator":inc.get("regulator",""),
+          "severity":inc.get("severity",""),"penalty_action":inc.get("penalty_action",""),
+          "date":inc.get("date","")}
+         for i, inc in enumerate(analysis.get("incident_log",[])[:15])], default=str)
+    themes_summary     = json.dumps(analysis.get("key_risk_themes",[])[:5], default=str)
+    weaknesses_summary = json.dumps(analysis.get("systemic_weaknesses",[])[:5], default=str)
 
-    # Get latest analysis
-    latest_analysis = await db.analyses.find_one(
-        {"company_id": company_id}, sort=[("created_at", -1)]
-    )
-    analysis_data = latest_analysis.get("analysis", {}) if latest_analysis else {}
+    system = f"""You are a senior compliance analyst AI assistant at JHS & Associates LLP.
+You are currently reviewing the compliance analysis for {company_name}.
 
-    compliant_count = sum(1 for i in items if i.get("status") == "compliant")
-    pending_count = sum(1 for i in items if i.get("status") == "pending")
-    nc_count = sum(1 for i in items if i.get("status") == "non-compliant")
-    health_pct = round((compliant_count / len(items) * 100)) if items else 0
+LIVE ANALYSIS CONTEXT:
+- Risk Level: {analysis.get('risk_level','Unknown')} | Health Score: {analysis.get('overall_score',0)}/100
+- Total Incidents: {analysis.get('total_incidents', len(analysis.get('incident_log',[])))}
+- Risk Summary: {analysis.get('risk_summary','')}
 
-    system_prompt = """You are a senior Partner at JHS & Associates LLP preparing board-level executive summaries.
-Your summaries are used by Independent Directors and Audit Committees.
-Write in professional, precise language. JSON only — no markdown."""
+INCIDENT LOG (numbered, 1-indexed):
+{incidents_summary}
 
-    user_prompt = f"""Generate a comprehensive Executive Compliance Summary for the Board/Audit Committee of {company["name"]}.
+KEY RISK THEMES: {themes_summary}
+SYSTEMIC WEAKNESSES: {weaknesses_summary}
 
-COMPANY: {company["name"]} | {company.get("industry")} | {company.get("listing_status", "Listed")}
-CIN: {company.get("cin", "N/A")} | PAN: {company.get("pan", "N/A")}
-REPORT DATE: {datetime.utcnow().strftime("%d %B %Y")}
+YOUR ROLE:
+1. EXPLAIN — any incident, theme, weakness, regulation, or risk score in plain language
+2. VERIFY — if the user questions an incident, explain why it was flagged with source references
+3. CORRECT — if user says an incident is wrong/outdated/irrelevant, propose to remove or modify it
+4. ADVISE — give specific next steps, remediation timelines, responsible owners
+5. UPDATE — apply corrections via the action field
 
-COMPLIANCE METRICS:
-- Total Items: {len(items)}
-- Compliant: {compliant_count} ({health_pct}%)
-- Pending: {pending_count}
-- Non-Compliant: {nc_count}
+CORRECTION RULES:
+- Only remove an incident if user explicitly says it's incorrect, not applicable, or already resolved
+- When updating, preserve all other fields unchanged
+- Changes apply live to the user's screen — be precise
 
-DETAILED COMPLIANCE DATA:
-{json.dumps(items[:20], indent=2, default=str)}
-
-PRIOR AI ANALYSIS:
-{json.dumps(analysis_data, indent=2, default=str)}
-
-Return JSON with EXACTLY these keys:
+Respond ONLY with this JSON (no markdown, no preamble):
 {{
-  "report_date": "{datetime.utcnow().strftime("%d %B %Y")}",
-  "health_score": {health_pct},
-  "overall_status": "Satisfactory|Needs Attention|Critical",
-  "executive_overview": "<3-4 paragraph board-ready narrative summary>",
-  "key_metrics": {{
-    "total_items": {len(items)},
-    "compliant": {compliant_count},
-    "pending": {pending_count},
-    "non_compliant": {nc_count},
-    "compliance_rate": "{health_pct}%",
-    "critical_deadlines_30days": <count>
-  }},
-  "framework_status": [
-    {{"framework": "<name>", "status": "Green|Amber|Red", "items": <n>, "issues": "<summary>"}}
-  ],
-  "critical_areas": [
-    {{"area": "<area>", "risk": "High|Medium|Low", "finding": "<finding>", "action_required": "<action>", "deadline": "<date>"}}
-  ],
-  "governance_gaps": [
-    {{"gap": "<gap identified>", "impact": "<business/legal impact>", "recommendation": "<what to do>"}}
-  ],
-  "immediate_actions": [
-    {{"priority": 1, "action": "<specific action>", "responsible": "<who>", "deadline": "<date>", "consequence_if_delayed": "<consequence>"}}
-  ],
-  "compliance_calendar_90days": [
-    {{"date": "<date>", "obligation": "<obligation>", "framework": "<framework>", "priority": "High|Medium|Low"}}
-  ],
-  "jhs_recommendations": [
-    {{"category": "<category>", "recommendation": "<detailed JHS recommendation>", "timeline": "<timeline>"}}
-  ],
-  "disclaimer": "This report has been prepared by JHS & Associates LLP based on information provided and is subject to the limitations of an outside-in review."
+  "response": "<clear professional explanation — use \\n• for bullet points>",
+  "action": null
+}}
+
+OR if a correction is requested:
+{{
+  "response": "<explanation of what you are changing and why>",
+  "action": {{
+    "type": "remove_incident" | "update_incident" | "update_risk" | "add_recommendation",
+    "incident_id": <1-based index — only for incident actions>,
+    "changes": {{...field: new_value...}},
+    "reason": "<brief reason for change>"
+  }}
 }}"""
 
+    messages = []
+    for h in history[-8:]:
+        messages.append({"role":h["role"],"content":h["content"]})
+    messages.append({"role":"user","content":message})
+
     try:
-        summary_data = await call_gpt(system_prompt, user_prompt, max_tokens=4000)
+        r = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role":"system","content":system}] + messages,
+            temperature=0.4, max_tokens=1500,
+            response_format={"type":"json_object"})
+        return json.loads(r.choices[0].message.content)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Summary generation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
 
-    doc = {
-        "company_id": company_id,
-        "company_name": company["name"],
-        "summary": summary_data,
-        "created_at": datetime.utcnow().isoformat(),
-    }
-    await db.summaries.insert_one(doc)
-    return serialize(doc)
+# ── Pydantic Models ───────────────────────────────────────
+class CompanyCreate(BaseModel):
+    name: str; industry: str
+    cin: Optional[str] = ""; pan: Optional[str] = ""
+    competitors: List[str] = []; description: Optional[str] = ""
+    listing_status: Optional[str] = "Listed"
 
+class ComplianceItemCreate(BaseModel):
+    company_id: str; category: str; sub_category: Optional[str] = ""
+    title: str; description: Optional[str] = ""; due_date: str
+    status: str = "pending"; priority: str = "medium"
+    responsible_person: Optional[str] = ""; section_reference: Optional[str] = ""
+    notes: Optional[str] = ""
+
+# ── Dashboard ─────────────────────────────────────────────
+@app.get("/api/dashboard")
+async def get_dashboard(company_id: Optional[str] = Query(None)):
+    query = {}
+    if company_id: query["company_id"] = company_id
+    total_companies = await db.companies.count_documents({})
+    total_items     = await db.compliance.count_documents(query)
+    compliant       = await db.compliance.count_documents({**query,"status":"compliant"})
+    pending         = await db.compliance.count_documents({**query,"status":"pending"})
+    non_compliant   = await db.compliance.count_documents({**query,"status":"non-compliant"})
+    total_docs      = await db.documents.count_documents(query)
+    categories = {}
+    async for item in db.compliance.find(query):
+        cat = item.get("category","Other"); status = item.get("status","pending")
+        if cat not in categories: categories[cat] = {"compliant":0,"pending":0,"non-compliant":0,"total":0}
+        categories[cat][status] = categories[cat].get(status,0)+1; categories[cat]["total"]+=1
+    now = datetime.utcnow(); upcoming = []
+    async for item in db.compliance.find({**query,"status":{"$ne":"compliant"}}):
+        due = item.get("due_date","")
+        if due:
+            try:
+                due_dt = datetime.fromisoformat(due); days_left = (due_dt-now).days
+                if 0 <= days_left <= 30:
+                    d = serialize(item); d["days_left"]=days_left; upcoming.append(d)
+            except: pass
+    upcoming.sort(key=lambda x:x.get("days_left",999))
+    return {"total_companies":total_companies,"total_items":total_items,"compliant":compliant,
+            "pending":pending,"non_compliant":non_compliant,"total_documents":total_docs,
+            "categories":categories,"upcoming_deadlines":upcoming[:5]}
+
+# ── Companies ─────────────────────────────────────────────
+@app.get("/api/companies")
+async def list_companies():
+    companies=[]
+    async for c in db.companies.find().sort("name",1): companies.append(serialize(c))
+    return companies
+
+@app.post("/api/companies",status_code=201)
+async def create_company(company: CompanyCreate):
+    doc={**company.model_dump(),"created_at":datetime.utcnow().isoformat()}
+    result=await db.companies.insert_one(doc)
+    return serialize(await db.companies.find_one({"_id":result.inserted_id}))
+
+@app.get("/api/companies/{company_id}")
+async def get_company(company_id:str):
+    c=await db.companies.find_one({"_id":to_object_id(company_id)})
+    if not c: raise HTTPException(status_code=404,detail="Company not found")
+    return serialize(c)
+
+@app.put("/api/companies/{company_id}")
+async def update_company(company_id:str,company:CompanyCreate):
+    await db.companies.update_one({"_id":to_object_id(company_id)},
+        {"$set":{**company.model_dump(),"updated_at":datetime.utcnow().isoformat()}})
+    return serialize(await db.companies.find_one({"_id":to_object_id(company_id)}))
+
+@app.delete("/api/companies/{company_id}")
+async def delete_company(company_id:str):
+    await db.companies.delete_one({"_id":to_object_id(company_id)})
+    return {"message":"Company deleted"}
+
+# ── Compliance ────────────────────────────────────────────
+@app.get("/api/compliance")
+async def list_compliance(company_id: Optional[str]=Query(None)):
+    query={}
+    if company_id: query["company_id"]=company_id
+    items=[]
+    async for item in db.compliance.find(query).sort("due_date",1): items.append(serialize(item))
+    return items
+
+@app.post("/api/compliance",status_code=201)
+async def create_compliance(item:ComplianceItemCreate):
+    doc={**item.model_dump(),"created_at":datetime.utcnow().isoformat()}
+    result=await db.compliance.insert_one(doc)
+    return serialize(await db.compliance.find_one({"_id":result.inserted_id}))
+
+@app.put("/api/compliance/{item_id}")
+async def update_compliance(item_id:str,item:ComplianceItemCreate):
+    await db.compliance.update_one({"_id":to_object_id(item_id)},
+        {"$set":{**item.model_dump(),"updated_at":datetime.utcnow().isoformat()}})
+    return serialize(await db.compliance.find_one({"_id":to_object_id(item_id)}))
+
+@app.delete("/api/compliance/{item_id}")
+async def delete_compliance(item_id:str):
+    await db.compliance.delete_one({"_id":to_object_id(item_id)}); return {"message":"Item deleted"}
+
+@app.post("/api/compliance/seed/{company_id}")
+async def seed_compliance(company_id:str):
+    company=await db.companies.find_one({"_id":to_object_id(company_id)})
+    if not company: raise HTTPException(status_code=404,detail="Company not found")
+    today=datetime.utcnow()
+    def d(months=0,day=None):
+        import calendar
+        m=today.month+months; y=today.year+(m-1)//12; m=((m-1)%12)+1
+        if day is None: day=min(today.day,calendar.monthrange(y,m)[1])
+        return datetime(y,m,day).isoformat()
+    templates=[
+        {"category":"Companies Act 2013","title":"Annual General Meeting (AGM)","due_date":d(6),"priority":"high","section_reference":"Section 96"},
+        {"category":"Companies Act 2013","title":"Board Meeting (Quarterly)","due_date":d(1),"priority":"high","section_reference":"Section 173"},
+        {"category":"Companies Act 2013","title":"Annual Return (MGT-7)","due_date":d(6),"priority":"high","section_reference":"Section 92"},
+        {"category":"Companies Act 2013","title":"Financial Statements Filing (AOC-4)","due_date":d(6),"priority":"high","section_reference":"Section 137"},
+        {"category":"Companies Act 2013","title":"CSR Report (if applicable)","due_date":d(3),"priority":"medium","section_reference":"Section 135"},
+        {"category":"Companies Act 2013","title":"Director KYC (DIR-3 KYC)","due_date":d(3),"priority":"medium","section_reference":"Rule 12A"},
+        {"category":"SEBI LODR","title":"Quarterly Financial Results","due_date":d(1),"priority":"high","section_reference":"Regulation 33"},
+        {"category":"SEBI LODR","title":"Corporate Governance Report (Q)","due_date":d(1),"priority":"high","section_reference":"Regulation 27"},
+        {"category":"SEBI LODR","title":"Related Party Transaction Disclosure","due_date":d(2),"priority":"high","section_reference":"Regulation 23"},
+        {"category":"SEBI LODR","title":"Insider Trading Policy Update","due_date":d(3),"priority":"medium","section_reference":"Regulation 9"},
+        {"category":"SEBI LODR","title":"Annual Report Submission","due_date":d(5),"priority":"high","section_reference":"Regulation 34"},
+        {"category":"Income Tax/GST","title":"TDS Return (Form 24Q/26Q)","due_date":d(1,31),"priority":"high","section_reference":"Section 200"},
+        {"category":"Income Tax/GST","title":"Advance Tax Payment (Q)","due_date":d(1,15),"priority":"high","section_reference":"Section 208"},
+        {"category":"Income Tax/GST","title":"GST Monthly Return (GSTR-1)","due_date":d(1,11),"priority":"high","section_reference":"Section 37 CGST"},
+        {"category":"Income Tax/GST","title":"GST Monthly Payment (GSTR-3B)","due_date":d(1,20),"priority":"high","section_reference":"Section 39 CGST"},
+        {"category":"Income Tax/GST","title":"Income Tax Return Filing","due_date":d(4,31),"priority":"high","section_reference":"Section 139"},
+        {"category":"Income Tax/GST","title":"GST Annual Return (GSTR-9)","due_date":d(8,31),"priority":"medium","section_reference":"Section 44 CGST"},
+        {"category":"FEMA/RBI","title":"FEMA Annual Return (FLA)","due_date":d(0,15),"priority":"high","section_reference":"FEMA 20R"},
+        {"category":"FEMA/RBI","title":"ECB Reporting (Form ECB-2)","due_date":d(1,7),"priority":"medium","section_reference":"FEMA 3R"},
+        {"category":"FEMA/RBI","title":"RBI Monthly Return (if applicable)","due_date":d(1,15),"priority":"medium","section_reference":"RBI Master Direction"},
+        {"category":"Companies Act 2013","title":"Statutory Audit Completion","due_date":d(4),"priority":"high","section_reference":"Section 143"},
+        {"category":"SEBI ICDR","title":"Post-Issue Compliance Report","due_date":d(2),"priority":"medium","section_reference":"Regulation 76 ICDR"},
+        {"category":"Companies Act 2013","title":"Secretarial Audit (MR-3)","due_date":d(5),"priority":"medium","section_reference":"Section 204"},
+    ]
+    docs=[{**t,"company_id":company_id,"status":"pending","responsible_person":"","notes":"",
+           "description":f"Mandatory {t['category']} compliance obligation","sub_category":"",
+           "created_at":datetime.utcnow().isoformat()} for t in templates]
+    await db.compliance.insert_many(docs)
+    return {"message":f"Seeded {len(docs)} compliance items","count":len(docs)}
+
+# ── Executive Summary ─────────────────────────────────────
+@app.post("/api/summary")
+async def generate_summary(data:dict):
+    company_id=data.get("company_id")
+    if not company_id: raise HTTPException(status_code=400,detail="company_id required")
+    company=await db.companies.find_one({"_id":to_object_id(company_id)})
+    if not company: raise HTTPException(status_code=404,detail="Company not found")
+    items=[]
+    async for item in db.compliance.find({"company_id":company_id}): items.append(serialize(item))
+    latest=await db.analyses.find_one({"company_id":company_id},sort=[("created_at",-1)])
+    analysis_data=latest.get("analysis",{}) if latest else {}
+    compliant_count=sum(1 for i in items if i.get("status")=="compliant")
+    pending_count=sum(1 for i in items if i.get("status")=="pending")
+    nc_count=sum(1 for i in items if i.get("status")=="non-compliant")
+    health_pct=round(compliant_count/len(items)*100) if items else 0
+    sys_="You are a senior Partner at JHS & Associates LLP preparing board-level executive summaries. JSON only."
+    usr=f"""Generate Executive Compliance Summary for {company['name']}.
+COMPANY: {company['name']} | {company.get('industry')} | {company.get('listing_status','Listed')}
+CIN: {company.get('cin','N/A')} | DATE: {datetime.utcnow().strftime('%d %B %Y')}
+METRICS: Total {len(items)} | Compliant {compliant_count} ({health_pct}%) | Pending {pending_count} | Non-Compliant {nc_count}
+DATA: {json.dumps(items[:20],indent=2,default=str)}
+ANALYSIS: {json.dumps(analysis_data,indent=2,default=str)}
+Return JSON: {{"report_date":"{datetime.utcnow().strftime('%d %B %Y')}","health_score":{health_pct},"overall_status":"Satisfactory|Needs Attention|Critical","executive_overview":"<3-4 para board narrative>","key_metrics":{{"total_items":{len(items)},"compliant":{compliant_count},"pending":{pending_count},"non_compliant":{nc_count},"compliance_rate":"{health_pct}%","critical_deadlines_30days":"<n>"}},"framework_status":[{{"framework":"<name>","status":"Green|Amber|Red","items":"<n>","issues":"<summary>"}}],"critical_areas":[{{"area":"<area>","risk":"High|Medium|Low","finding":"<finding>","action_required":"<action>","deadline":"<date>"}}],"governance_gaps":[{{"gap":"<gap>","impact":"<impact>","recommendation":"<action>"}}],"immediate_actions":[{{"priority":1,"action":"<action>","responsible":"<who>","deadline":"<date>","consequence_if_delayed":"<consequence>"}}],"compliance_calendar_90days":[{{"date":"<date>","obligation":"<obligation>","framework":"<framework>","priority":"High|Medium|Low"}}],"jhs_recommendations":[{{"category":"<cat>","recommendation":"<rec>","timeline":"<timeline>"}}],"disclaimer":"Prepared by JHS & Associates LLP."}}"""
+    try:
+        summary_data=await call_gpt(sys_,usr,max_tokens=4000)
+    except Exception as e:
+        raise HTTPException(status_code=500,detail=f"Summary failed: {str(e)}")
+    doc={"company_id":company_id,"company_name":company["name"],"summary":summary_data,"created_at":datetime.utcnow().isoformat()}
+    await db.summaries.insert_one(doc); return serialize(doc)
 
 @app.get("/api/summary")
-async def list_summaries(company_id: Optional[str] = Query(None)):
-    query = {}
-    if company_id:
-        query["company_id"] = company_id
-    results = []
-    async for item in db.summaries.find(query).sort("created_at", -1).limit(10):
-        results.append(serialize(item))
+async def list_summaries(company_id:Optional[str]=Query(None)):
+    query={}
+    if company_id: query["company_id"]=company_id
+    results=[]
+    async for item in db.summaries.find(query).sort("created_at",-1).limit(10): results.append(serialize(item))
     return results
 
-
-# ─────────────────────────────────────────────────────────
-# COMPETITOR BENCHMARKING
-# ─────────────────────────────────────────────────────────
+# ── Benchmarking ──────────────────────────────────────────
 @app.post("/api/benchmarking")
-async def run_benchmarking(data: dict):
-    company_id = data.get("company_id")
-    if not company_id:
-        raise HTTPException(status_code=400, detail="company_id is required")
-
-    company = await db.companies.find_one({"_id": to_object_id(company_id)})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    competitors = company.get("competitors", [])
-    if not competitors:
-        raise HTTPException(
-            status_code=400,
-            detail="No competitors configured. Edit the company and add competitors first.",
-        )
-
-    items = []
-    async for item in db.compliance.find({"company_id": company_id}):
-        items.append(serialize(item))
-
-    comp1 = competitors[0] if len(competitors) > 0 else "Competitor 1"
-    comp2 = competitors[1] if len(competitors) > 1 else "Competitor 2"
-
-    system_prompt = """You are an Indian corporate governance benchmarking specialist at JHS & Associates LLP.
-You have deep knowledge of BSE/NSE-listed company governance, SEBI compliance, and industry best practices.
-JSON only — no markdown."""
-
-    user_prompt = f"""Conduct a governance & compliance benchmarking analysis for {company["name"]} 
-vs its top 2 competitors: {comp1} and {comp2}.
-
-SUBJECT COMPANY: {company["name"]} | {company.get("industry")} | {company.get("listing_status", "Listed")}
-
-COMPLIANCE DATA FOR {company["name"]}:
-{json.dumps(items[:15], indent=2, default=str)}
-
-Based on publicly available information, regulatory filings (BSE/NSE), annual reports, 
-and industry standards, provide a comprehensive benchmarking analysis.
-
-Return JSON with EXACTLY these keys:
-{{
-  "company_score": <0-100>,
-  "competitor_scores": [
-    {{"name": "{comp1}", "score": <0-100>, "rationale": "<why>"}},
-    {{"name": "{comp2}", "score": <0-100>, "rationale": "<why>"}}
-  ],
-  "industry_average_score": <0-100>,
-  "comparison_table": [
-    {{
-      "parameter": "<governance parameter>",
-      "company": {{"value": "<value>", "score": <0-10>, "status": "Strong|Average|Weak"}},
-      "{comp1}": {{"value": "<value>", "score": <0-10>, "status": "Strong|Average|Weak"}},
-      "{comp2}": {{"value": "<value>", "score": <0-10>, "status": "Strong|Average|Weak"}},
-      "industry_benchmark": "<benchmark standard>"
-    }}
-  ],
-  "competitive_strengths": ["<area where company leads>"],
-  "competitive_gaps": [
-    {{"gap": "<area>", "company_position": "<current>", "competitor_best": "<competitor name + their approach>", "improvement_action": "<what to do>"}}
-  ],
-  "peer_insights": [
-    {{"insight": "<interesting finding from peer comparison>", "implication": "<what it means>"}}
-  ],
-  "ranking": {{
-    "overall": <1|2|3>,
-    "by_framework": {{
-      "Companies Act": <1|2|3>,
-      "SEBI LODR": <1|2|3>,
-      "Risk Management": <1|2|3>,
-      "Disclosures": <1|2|3>
-    }}
-  }},
-  "overall_assessment": "<3-4 sentence executive assessment>"
-}}"""
-
-    try:
-        benchmark_data = await call_gpt(system_prompt, user_prompt, max_tokens=3000)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Benchmarking failed: {str(e)}")
-
-    doc = {
-        "company_id": company_id,
-        "company_name": company["name"],
-        "competitors": competitors[:2],
-        "benchmark": benchmark_data,
-        "created_at": datetime.utcnow().isoformat(),
-    }
-    await db.benchmarks.insert_one(doc)
-    return serialize(doc)
-
+async def run_benchmarking(data:dict):
+    company_id=data.get("company_id")
+    if not company_id: raise HTTPException(status_code=400,detail="company_id required")
+    company=await db.companies.find_one({"_id":to_object_id(company_id)})
+    if not company: raise HTTPException(status_code=404,detail="Company not found")
+    competitors=company.get("competitors",[])
+    if not competitors: raise HTTPException(status_code=400,detail="No competitors configured")
+    items=[]
+    async for item in db.compliance.find({"company_id":company_id}): items.append(serialize(item))
+    comp1=competitors[0] if competitors else "Competitor 1"
+    comp2=competitors[1] if len(competitors)>1 else "Competitor 2"
+    sys_="You are an Indian corporate governance benchmarking specialist at JHS & Associates LLP. JSON only."
+    usr=f"""Benchmark {company['name']} vs {comp1} and {comp2}.
+Subject: {company['name']} | {company.get('industry')} | {company.get('listing_status','Listed')}
+Data: {json.dumps(items[:15],indent=2,default=str)}
+Return JSON: {{"company_score":<0-100>,"competitor_scores":[{{"name":"{comp1}","score":<0-100>,"rationale":"<why>"}},{{"name":"{comp2}","score":<0-100>,"rationale":"<why>"}}],"industry_average_score":<0-100>,"comparison_table":[{{"parameter":"<param>","company":{{"value":"<v>","score":<0-10>,"status":"Strong|Average|Weak"}},"{comp1}":{{"value":"<v>","score":<0-10>,"status":"Strong|Average|Weak"}},"{comp2}":{{"value":"<v>","score":<0-10>,"status":"Strong|Average|Weak"}},"industry_benchmark":"<std>"}}],"competitive_strengths":["<s>"],"competitive_gaps":[{{"gap":"<area>","company_position":"<current>","competitor_best":"<name+approach>","improvement_action":"<action>"}}],"peer_insights":[{{"insight":"<finding>","implication":"<meaning>"}}],"ranking":{{"overall":<1|2|3>,"by_framework":{{"Companies Act":<1|2|3>,"SEBI LODR":<1|2|3>,"Risk Management":<1|2|3>,"Disclosures":<1|2|3>}}}},"overall_assessment":"<3-4 sentence assessment>"}}"""
+    try: benchmark_data=await call_gpt(sys_,usr,max_tokens=3000)
+    except Exception as e: raise HTTPException(status_code=500,detail=f"Benchmarking failed: {str(e)}")
+    doc={"company_id":company_id,"company_name":company["name"],"competitors":competitors[:2],"benchmark":benchmark_data,"created_at":datetime.utcnow().isoformat()}
+    await db.benchmarks.insert_one(doc); return serialize(doc)
 
 @app.get("/api/benchmarking")
-async def list_benchmarks(company_id: Optional[str] = Query(None)):
-    query = {}
-    if company_id:
-        query["company_id"] = company_id
-    results = []
-    async for item in db.benchmarks.find(query).sort("created_at", -1).limit(5):
-        results.append(serialize(item))
+async def list_benchmarks(company_id:Optional[str]=Query(None)):
+    query={}
+    if company_id: query["company_id"]=company_id
+    results=[]
+    async for item in db.benchmarks.find(query).sort("created_at",-1).limit(5): results.append(serialize(item))
     return results
 
-
-# ─────────────────────────────────────────────────────────
-# QUESTION BANK
-# ─────────────────────────────────────────────────────────
+# ── Question Bank ─────────────────────────────────────────
 @app.post("/api/questions")
-async def generate_questions(data: dict):
-    company_id = data.get("company_id")
-    role = data.get("role", "director")
-    if not company_id:
-        raise HTTPException(status_code=400, detail="company_id is required")
-
-    company = await db.companies.find_one({"_id": to_object_id(company_id)})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    items = []
-    async for item in db.compliance.find({"company_id": company_id}):
-        items.append(serialize(item))
-
-    latest_analysis = await db.analyses.find_one(
-        {"company_id": company_id}, sort=[("created_at", -1)]
-    )
-    findings = latest_analysis.get("analysis", {}) if latest_analysis else {}
-
-    role_title = "Independent Director" if role == "director" else "Internal Auditor"
-    focus = (
-        "board oversight, governance, strategic risk, management accountability, and fiduciary duties"
-        if role == "director"
-        else "internal controls, process effectiveness, audit findings, operational risk, and control environment"
-    )
-
-    system_prompt = f"""You are a senior advisor who prepares curated question banks for {role_title}s 
-at Indian listed companies. You help {role_title}s ask management the right, incisive questions 
-to discharge their duties effectively under Companies Act 2013, SEBI LODR, and RBI/FEMA.
-JSON only."""
-
-    user_prompt = f"""Generate a comprehensive question bank for the {role_title} of {company["name"]} 
-({company.get("industry")}).
-
-Focus areas: {focus}
-
-COMPLIANCE CONTEXT:
-{json.dumps(items[:15], indent=2, default=str)}
-
-RISK FINDINGS:
-{json.dumps(findings, indent=2, default=str)}
-
-Generate 25 high-quality, probing questions. Make them specific, actionable, and contextual 
-to this company's compliance status.
-
-Return JSON with key "questions" containing array of objects:
-{{
-  "questions": [
-    {{
-      "id": 1,
-      "category": "Statutory Compliance|Financial Controls|Governance & Risk|Management Accountability|Forward-Looking|Related Party Transactions|Audit & Assurance",
-      "question": "<specific, probing question>",
-      "rationale": "<why this question matters>",
-      "expected_answer_elements": ["<element 1>", "<element 2>"],
-      "follow_up": "<suggested follow-up question>",
-      "priority": "High|Medium|Low",
-      "applicable_regulation": "<regulation reference>"
-    }}
-  ]
-}}"""
-
-    try:
-        questions_data = await call_gpt(system_prompt, user_prompt, max_tokens=3000)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Question generation failed: {str(e)}")
-
-    doc = {
-        "company_id": company_id,
-        "company_name": company["name"],
-        "role": role,
-        "role_title": role_title,
-        "questions_data": questions_data,
-        "created_at": datetime.utcnow().isoformat(),
-    }
-    await db.questions.insert_one(doc)
-    return serialize(doc)
-
+async def generate_questions(data:dict):
+    company_id=data.get("company_id"); role=data.get("role","director")
+    if not company_id: raise HTTPException(status_code=400,detail="company_id required")
+    company=await db.companies.find_one({"_id":to_object_id(company_id)})
+    if not company: raise HTTPException(status_code=404,detail="Company not found")
+    items=[]
+    async for item in db.compliance.find({"company_id":company_id}): items.append(serialize(item))
+    latest=await db.analyses.find_one({"company_id":company_id},sort=[("created_at",-1)])
+    findings=latest.get("analysis",{}) if latest else {}
+    role_title="Independent Director" if role=="director" else "Internal Auditor"
+    focus=("board oversight, governance, strategic risk, management accountability, fiduciary duties" if role=="director"
+           else "internal controls, process effectiveness, audit findings, operational risk, control environment")
+    sys_=f"You are a senior advisor preparing question banks for {role_title}s at Indian listed companies. JSON only."
+    usr=f"""Generate 25 probing questions for the {role_title} of {company['name']} ({company.get('industry')}).
+Focus: {focus}
+Compliance: {json.dumps(items[:15],indent=2,default=str)}
+Findings: {json.dumps(findings,indent=2,default=str)}
+Return JSON with "questions" array: [{{"id":1,"category":"Statutory Compliance|Financial Controls|Governance & Risk|Management Accountability|Forward-Looking|Related Party Transactions|Audit & Assurance","question":"<specific probing question>","rationale":"<why it matters>","expected_answer_elements":["<el1>","<el2>"],"follow_up":"<follow-up question>","priority":"High|Medium|Low","applicable_regulation":"<regulation ref>"}}]"""
+    try: questions_data=await call_gpt(sys_,usr,max_tokens=3000)
+    except Exception as e: raise HTTPException(status_code=500,detail=f"Questions failed: {str(e)}")
+    doc={"company_id":company_id,"company_name":company["name"],"role":role,"role_title":role_title,"questions_data":questions_data,"created_at":datetime.utcnow().isoformat()}
+    await db.questions.insert_one(doc); return serialize(doc)
 
 @app.get("/api/questions")
-async def list_questions(company_id: Optional[str] = Query(None), role: Optional[str] = Query(None)):
-    query = {}
-    if company_id:
-        query["company_id"] = company_id
-    if role:
-        query["role"] = role
-    results = []
-    async for item in db.questions.find(query).sort("created_at", -1).limit(10):
-        results.append(serialize(item))
+async def list_questions(company_id:Optional[str]=Query(None),role:Optional[str]=Query(None)):
+    query={}
+    if company_id: query["company_id"]=company_id
+    if role: query["role"]=role
+    results=[]
+    async for item in db.questions.find(query).sort("created_at",-1).limit(10): results.append(serialize(item))
     return results
 
-
-# ─────────────────────────────────────────────────────────
-# DOCUMENTS
-# ─────────────────────────────────────────────────────────
+# ── Documents ─────────────────────────────────────────────
 @app.post("/api/documents")
-async def upload_document(
-    file: UploadFile = File(...),
-    company_id: Optional[str] = Form(None),
-):
-    # Validate file type
-    allowed = {".pdf", ".xlsx", ".xls", ".csv", ".doc", ".docx"}
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in allowed:
-        raise HTTPException(status_code=400, detail=f"File type {ext} not allowed")
-
-    safe_name = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
-    file_path = os.path.join(UPLOAD_DIR, safe_name)
-
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    size = os.path.getsize(file_path)
-    doc = {
-        "company_id": company_id,
-        "original_filename": file.filename,
-        "stored_filename": safe_name,
-        "file_path": file_path,
-        "file_size": size,
-        "file_size_readable": f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / 1024 / 1024:.1f} MB",
-        "file_type": ext.lstrip(".").upper(),
-        "uploaded_at": datetime.utcnow().isoformat(),
-    }
-    result = await db.documents.insert_one(doc)
-    doc["_id"] = str(result.inserted_id)
-    return doc
-
+async def upload_document(file:UploadFile=File(...),company_id:Optional[str]=Form(None)):
+    allowed={".pdf",".xlsx",".xls",".csv",".doc",".docx"}
+    ext=os.path.splitext(file.filename)[1].lower()
+    if ext not in allowed: raise HTTPException(status_code=400,detail=f"File type {ext} not allowed")
+    safe_name=f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
+    file_path=os.path.join(UPLOAD_DIR,safe_name)
+    with open(file_path,"wb") as f: shutil.copyfileobj(file.file,f)
+    size=os.path.getsize(file_path)
+    doc={"company_id":company_id,"original_filename":file.filename,"stored_filename":safe_name,
+         "file_path":file_path,"file_size":size,
+         "file_size_readable":f"{size/1024:.1f} KB" if size<1048576 else f"{size/1048576:.1f} MB",
+         "file_type":ext.lstrip(".").upper(),"uploaded_at":datetime.utcnow().isoformat()}
+    result=await db.documents.insert_one(doc); doc["_id"]=str(result.inserted_id); return doc
 
 @app.get("/api/documents")
-async def list_documents(company_id: Optional[str] = Query(None)):
-    query = {}
-    if company_id:
-        query["company_id"] = company_id
-    docs = []
-    async for doc in db.documents.find(query).sort("uploaded_at", -1):
-        docs.append(serialize(doc))
+async def list_documents(company_id:Optional[str]=Query(None)):
+    query={}
+    if company_id: query["company_id"]=company_id
+    docs=[]
+    async for doc in db.documents.find(query).sort("uploaded_at",-1): docs.append(serialize(doc))
     return docs
 
-
 @app.delete("/api/documents/{doc_id}")
-async def delete_document(doc_id: str):
-    doc = await db.documents.find_one({"_id": to_object_id(doc_id)})
+async def delete_document(doc_id:str):
+    doc=await db.documents.find_one({"_id":to_object_id(doc_id)})
     if doc:
-        path = doc.get("file_path", "")
-        if path and os.path.exists(path):
-            os.remove(path)
-        await db.documents.delete_one({"_id": to_object_id(doc_id)})
-    return {"message": "Document deleted"}
+        p=doc.get("file_path","")
+        if p and os.path.exists(p): os.remove(p)
+        await db.documents.delete_one({"_id":to_object_id(doc_id)})
+    return {"message":"Document deleted"}
 
+# ── Static & SPA ──────────────────────────────────────────
+app.mount("/static",StaticFiles(directory="static"),name="static")
 
-# ─────────────────────────────────────────────────────────
-# Serve Static Frontend
-# ─────────────────────────────────────────────────────────
-app.mount("/static", StaticFiles(directory="static"), name="static")
+@app.get("/",response_class=HTMLResponse)
+async def root(): return FileResponse("static/index.html")
 
-
-@app.get("/", response_class=HTMLResponse)
-async def root():
+@app.get("/{full_path:path}",response_class=HTMLResponse)
+async def catch_all(full_path:str):
+    if full_path.startswith("api/"): raise HTTPException(status_code=404)
     return FileResponse("static/index.html")
 
-
-@app.get("/{full_path:path}", response_class=HTMLResponse)
-async def catch_all(full_path: str):
-    if full_path.startswith("api/"):
-        raise HTTPException(status_code=404, detail="Not found")
-    return FileResponse("static/index.html")
-
-
-if __name__ == "__main__":
+if __name__=="__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app",host="0.0.0.0",port=8000,reload=True)

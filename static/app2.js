@@ -621,37 +621,287 @@ async function seedComplianceItems() {
 // ─────────────────────────────────────────────────────────
 // AI ANALYSIS
 // ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────
+// AGENT PIPELINE CONFIG
+// ─────────────────────────────────────────────────────────
+const AGENTS = [
+  { id:'orchestrator',    name:'Orchestrator',              icon:'🎯', desc:'Plans research strategy & risk areas',       color:'#0f2d5a' },
+  { id:'researcher_rbi',  name:'RBI & MCA Researcher',      icon:'🏛', desc:'RBI penalties · MCA orders · Parliamentary', color:'#1d4ed8' },
+  { id:'researcher_sebi', name:'SEBI & Exchange Researcher', icon:'📈', desc:'SEBI orders · BSE/NSE filings · LODR',       color:'#7c3aed' },
+  { id:'researcher_tax',  name:'Tax & Media Researcher',    icon:'📰', desc:'IT Dept · GST · FEMA · Financial media',     color:'#0891b2' },
+  { id:'extractor',       name:'Data Extractor',            icon:'⚙',  desc:'Structures 9-field incident data',           color:'#d97706' },
+  { id:'verifier',        name:'Verifier & Fact-Checker',   icon:'✅', desc:'Cross-checks citations & source URLs',       color:'#059669' },
+  { id:'analyst',         name:'Pattern Analyst',           icon:'🔍', desc:'Repeat violations · Systemic weaknesses',    color:'#dc2626' },
+  { id:'reporter',        name:'Report Writer',             icon:'📝', desc:'Compiles board-ready final report',          color:'#c8a846' },
+];
+
+let pipelineSSE = null;
+
+// ─────────────────────────────────────────────────────────
+// AGENT PIPELINE UI
+// ─────────────────────────────────────────────────────────
+function buildAgentPipelineUI() {
+  const agentCards = AGENTS.map(a => `
+    <div id="agent-card-${a.id}" style="
+      border:1.5px solid #e4e8f0;border-radius:12px;padding:14px 16px;
+      background:#fff;transition:all .3s;position:relative;overflow:hidden">
+      <div style="display:flex;align-items:flex-start;gap:12px">
+        <div id="agent-icon-${a.id}" style="
+          width:40px;height:40px;border-radius:10px;background:${a.color}18;
+          display:flex;align-items:center;justify-content:center;font-size:18px;
+          flex-shrink:0;transition:all .3s">${a.icon}</div>
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px">
+            <span style="font-weight:700;font-size:13px;color:#0f172a">${a.name}</span>
+            <span id="agent-badge-${a.id}" style="
+              font-size:10px;padding:2px 8px;border-radius:20px;font-weight:600;
+              background:#f1f5f9;color:#94a3b8">Waiting</span>
+          </div>
+          <div style="font-size:11.5px;color:#64748b;margin-bottom:5px">${a.desc}</div>
+          <div id="agent-msg-${a.id}" style="font-size:11.5px;color:#475569;min-height:14px;line-height:1.4"></div>
+          <div id="agent-detail-${a.id}" style="font-size:11px;color:#94a3b8;margin-top:2px;min-height:12px"></div>
+        </div>
+        <div id="agent-spinner-${a.id}" style="display:none;flex-shrink:0">
+          <span class="spinner" style="width:18px;height:18px;border-width:2px;border-color:${a.color}40;border-top-color:${a.color}"></span>
+        </div>
+        <div id="agent-check-${a.id}" style="display:none;flex-shrink:0;color:${a.color}">
+          <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>
+        </div>
+        <div id="agent-error-${a.id}" style="display:none;flex-shrink:0;color:#ef4444">
+          <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4m0 4h.01"/></svg>
+        </div>
+      </div>
+      <!-- Animated bottom border for running state -->
+      <div id="agent-progress-${a.id}" style="
+        position:absolute;bottom:0;left:0;height:2px;width:0%;
+        background:linear-gradient(90deg,${a.color},${a.color}88);
+        transition:width 2s ease;border-radius:0 0 0 12px"></div>
+    </div>
+  `).join('');
+
+  return `
+    <!-- Pipeline Header -->
+    <div class="card" style="margin-bottom:16px;background:linear-gradient(135deg,#0f2d5a 0%,#1e3a7a 100%);border:none">
+      <div class="card-body" style="padding:20px 24px">
+        <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px">
+          <div style="width:44px;height:44px;background:rgba(255,255,255,.12);border-radius:12px;
+            display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0">🤖</div>
+          <div style="flex:1">
+            <div style="font-family:Outfit;font-weight:800;font-size:17px;color:white;margin-bottom:3px">
+              Agentic AI Pipeline Running
+            </div>
+            <div style="font-size:12.5px;color:rgba(255,255,255,.65)" id="pipeline-headline">
+              Initialising 8 specialist agents...
+            </div>
+          </div>
+          <div style="text-align:right;flex-shrink:0">
+            <div style="font-family:Outfit;font-size:28px;font-weight:800;color:white" id="pipeline-pct">0%</div>
+            <div style="font-size:11px;color:rgba(255,255,255,.5)">complete</div>
+          </div>
+        </div>
+        <!-- Progress bar -->
+        <div style="background:rgba(255,255,255,.15);border-radius:8px;height:6px;overflow:hidden">
+          <div id="pipeline-bar" style="height:100%;background:linear-gradient(90deg,#c8a846,#f0d060);
+            border-radius:8px;width:0%;transition:width .6s ease"></div>
+        </div>
+        <!-- Phase labels -->
+        <div style="display:flex;justify-content:space-between;margin-top:8px">
+          <span style="font-size:10px;color:rgba(255,255,255,.4)">Scope</span>
+          <span style="font-size:10px;color:rgba(255,255,255,.4)">Research</span>
+          <span style="font-size:10px;color:rgba(255,255,255,.4)">Extract</span>
+          <span style="font-size:10px;color:rgba(255,255,255,.4)">Verify</span>
+          <span style="font-size:10px;color:rgba(255,255,255,.4)">Analyse</span>
+          <span style="font-size:10px;color:rgba(255,255,255,.4)">Report</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Agent Cards Grid -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px" id="agent-cards-grid">
+      ${agentCards}
+    </div>
+
+    <!-- Live Feed -->
+    <div class="card">
+      <div class="card-header" style="border-bottom:1px solid #e4e8f0">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="width:8px;height:8px;background:#10b981;border-radius:50%;display:inline-block;animation:pulse 1.5s infinite"></span>
+          <h3 style="margin:0">Live Agent Feed</h3>
+        </div>
+        <span id="live-feed-count" style="font-size:11.5px;color:#94a3b8">0 events</span>
+      </div>
+      <div id="live-feed" style="
+        max-height:200px;overflow-y:auto;padding:12px 16px;
+        font-family:monospace;font-size:11.5px;color:#334155;
+        background:#f8fafc;border-radius:0 0 12px 12px"></div>
+    </div>`;
+}
+
+function updateAgentCard(agentId, status, message, detail) {
+  const card    = document.getElementById(`agent-card-${agentId}`);
+  const badge   = document.getElementById(`agent-badge-${agentId}`);
+  const msg     = document.getElementById(`agent-msg-${agentId}`);
+  const det     = document.getElementById(`agent-detail-${agentId}`);
+  const spin    = document.getElementById(`agent-spinner-${agentId}`);
+  const check   = document.getElementById(`agent-check-${agentId}`);
+  const err     = document.getElementById(`agent-error-${agentId}`);
+  const prog    = document.getElementById(`agent-progress-${agentId}`);
+  const icon    = document.getElementById(`agent-icon-${agentId}`);
+  const agent   = AGENTS.find(a => a.id === agentId);
+  if (!card) return;
+
+  spin.style.display = 'none';
+  check.style.display = 'none';
+  err.style.display = 'none';
+
+  if (status === 'running') {
+    card.style.borderColor = agent.color + '60';
+    card.style.background  = agent.color + '05';
+    icon.style.background  = agent.color + '25';
+    badge.style.background = agent.color + '18';
+    badge.style.color      = agent.color;
+    badge.textContent      = 'Running';
+    spin.style.display     = 'block';
+    prog.style.width       = '60%';
+  } else if (status === 'done') {
+    card.style.borderColor = '#10b981' + '60';
+    card.style.background  = '#10b98108';
+    badge.style.background = '#dcfce7';
+    badge.style.color      = '#059669';
+    badge.textContent      = '✓ Done';
+    check.style.display    = 'block';
+    prog.style.width       = '100%';
+    prog.style.background  = 'linear-gradient(90deg,#10b981,#34d399)';
+  } else if (status === 'error') {
+    card.style.borderColor = '#ef444460';
+    badge.style.background = '#fee2e2';
+    badge.style.color      = '#dc2626';
+    badge.textContent      = '✗ Error';
+    err.style.display      = 'block';
+    prog.style.width       = '100%';
+    prog.style.background  = '#ef4444';
+  }
+  if (message) msg.textContent = message;
+  if (detail)  det.textContent = detail;
+}
+
+function addLiveFeedEntry(timestamp, text, type='info') {
+  const feed  = document.getElementById('live-feed');
+  const count = document.getElementById('live-feed-count');
+  if (!feed) return;
+  const colors = { info:'#475569', success:'#059669', error:'#dc2626', agent:'#0f2d5a' };
+  const line   = document.createElement('div');
+  line.style.cssText = `padding:2px 0;border-bottom:1px solid #e4e8f0;color:${colors[type]||colors.info}`;
+  line.innerHTML = `<span style="color:#94a3b8;margin-right:8px">[${timestamp}]</span>${esc(text)}`;
+  feed.appendChild(line);
+  feed.scrollTop = feed.scrollHeight;
+  const n = feed.querySelectorAll('div').length;
+  if (count) count.textContent = `${n} event${n!==1?'s':''}`;
+}
+
+function updatePipelineProgress() {
+  const doneCount = AGENTS.filter(a => {
+    const b = document.getElementById(`agent-badge-${a.id}`);
+    return b && b.textContent.includes('Done');
+  }).length;
+  const pct = Math.round((doneCount / AGENTS.length) * 100);
+  const bar = document.getElementById('pipeline-bar');
+  const pctEl = document.getElementById('pipeline-pct');
+  const headline = document.getElementById('pipeline-headline');
+  if (bar) bar.style.width = pct + '%';
+  if (pctEl) pctEl.textContent = pct + '%';
+  if (headline && doneCount > 0) {
+    const phase = doneCount <= 1 ? 'Scoping & planning...'
+                : doneCount <= 4 ? 'Researching regulatory sources...'
+                : doneCount <= 5 ? 'Extracting & structuring data...'
+                : doneCount <= 6 ? 'Verifying facts & citations...'
+                : doneCount <= 7 ? 'Analysing patterns & themes...'
+                : 'Compiling final report...';
+    headline.textContent = phase;
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// RUN ANALYSIS (SSE Agent Pipeline)
+// ─────────────────────────────────────────────────────────
 async function runAnalysis() {
   const cid = document.getElementById('analysis-company-sel').value;
   if (!cid) { toast('Please select a company', 'error'); return; }
 
   const btn = document.getElementById('btn-run-analysis');
   btn.disabled = true;
-  btn.innerHTML = `<span class="spinner"></span> Analyzing...`;
+  btn.innerHTML = `<span class="spinner"></span> Agents Running...`;
 
-  document.getElementById('analysis-content').innerHTML = `
-    <div class="loading-overlay">
-      <div class="spinner spinner-navy" style="width:36px;height:36px;border-width:3px"></div>
-      <p>GPT-4o is analyzing compliance data...</p>
-      <p style="font-size:12px;margin-top:-8px">This may take 20–40 seconds</p>
-    </div>`;
+  // Close any existing SSE connection
+  if (pipelineSSE) { pipelineSSE.close(); pipelineSSE = null; }
 
-  try {
-    const data = await apiPost('/api/analysis', { company_id: cid });
-    renderAnalysis(data);
-    toast('Analysis complete', 'success');
-  } catch (e) {
-    document.getElementById('analysis-content').innerHTML = `
-      <div class="empty-state">
-        <svg fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4m0 4h.01"/></svg>
-        <h3>Analysis Failed</h3>
-        <p>${esc(e.message)}</p>
-      </div>`;
-    toast('Analysis failed: ' + e.message, 'error');
-  } finally {
+  // Show the agent pipeline UI
+  document.getElementById('analysis-content').innerHTML = buildAgentPipelineUI();
+
+  // Open SSE connection
+  pipelineSSE = new EventSource(`/api/analysis/stream?company_id=${encodeURIComponent(cid)}`);
+
+  pipelineSSE.onmessage = (event) => {
+    try {
+      const ev = JSON.parse(event.data);
+
+      if (ev.type === 'agent_update') {
+        updateAgentCard(ev.agent_id, ev.status, ev.message, ev.detail);
+        updatePipelineProgress();
+        if (ev.status === 'running') {
+          addLiveFeedEntry(ev.timestamp, `[${ev.agent_id}] ${ev.message}`, 'agent');
+        } else if (ev.status === 'done') {
+          addLiveFeedEntry(ev.timestamp, `✓ ${ev.agent_id}: ${ev.message}`, 'success');
+        } else if (ev.status === 'error') {
+          addLiveFeedEntry(ev.timestamp, `✗ ${ev.agent_id}: ${ev.message}`, 'error');
+        }
+
+      } else if (ev.type === 'log') {
+        addLiveFeedEntry(ev.timestamp, ev.text, 'info');
+
+      } else if (ev.type === 'complete') {
+        pipelineSSE.close(); pipelineSSE = null;
+        updatePipelineProgress();
+        addLiveFeedEntry(ev.timestamp, '🎉 Pipeline complete — rendering results...', 'success');
+        toast('Analysis complete — all 8 agents done!', 'success');
+        // Brief pause so user sees 100%, then render results
+        setTimeout(() => {
+          document.getElementById('analysis-content').innerHTML = '';
+          renderAnalysis(ev.data);
+        }, 1200);
+
+      } else if (ev.type === 'error') {
+        pipelineSSE.close(); pipelineSSE = null;
+        addLiveFeedEntry(ev.timestamp || '??:??:??', `Pipeline error: ${ev.message}`, 'error');
+        toast('Analysis failed: ' + ev.message, 'error');
+        document.getElementById('analysis-content').innerHTML = `
+          <div class="empty-state">
+            <svg fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4m0 4h.01"/></svg>
+            <h3>Pipeline Error</h3><p>${esc(ev.message)}</p>
+          </div>`;
+      }
+    } catch(e) {
+      console.error('SSE parse error:', e);
+    }
+  };
+
+  pipelineSSE.onerror = (e) => {
+    console.error('SSE connection error:', e);
+    addLiveFeedEntry(new Date().toTimeString().slice(0,8), 'Connection interrupted — check server', 'error');
+  };
+
+  // Reset button once SSE closes
+  const resetBtn = () => {
     btn.disabled = false;
     btn.innerHTML = `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg> Run Analysis`;
-  }
+  };
+  pipelineSSE.addEventListener('error', resetBtn);
+  // Also reset if SSE ends cleanly
+  const checkDone = setInterval(() => {
+    if (!pipelineSSE || pipelineSSE.readyState === EventSource.CLOSED) {
+      resetBtn(); clearInterval(checkDone);
+    }
+  }, 2000);
 }
 
 async function loadAnalysisHistory() {
@@ -662,64 +912,233 @@ async function loadAnalysisHistory() {
   if (items.length) renderAnalysis(items[0]);
 }
 
+
+
 function renderAnalysis(data) {
   const a = data.analysis || {};
   const riskColor = { High: '#ef4444', Medium: '#f59e0b', Low: '#10b981' };
   const rc = riskColor[a.risk_level] || '#64748b';
 
-  const findings = (a.non_compliance_findings || []).map(f => `
-    <div class="finding-card ${(f.severity||'').toLowerCase() === 'critical' || (f.severity||'').toLowerCase() === 'high' ? '' : (f.severity||'').toLowerCase() === 'medium' ? 'medium' : 'low'}">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
-        <div class="finding-title">${esc(f.finding || f.title || 'Finding')}</div>
-        <div style="display:flex;gap:6px;flex-shrink:0">
-          <span class="badge ${getSeverityClass(f.severity)}">${f.severity || 'N/A'}</span>
-          <span class="badge badge-navy" style="font-size:10px">${esc(f.framework || '')}</span>
+  // ── Helper: render source chips with links ──────────────────────────────
+  function renderSources(sources, containerId) {
+    if (!sources || !sources.length) return '';
+    const typeColor = { Official: '#0f2d5a', Filing: '#1d4ed8', Media: '#475569' };
+    const chips = sources.map(s => {
+      const col = typeColor[s.type] || '#475569';
+      const approx = s.url_approximate ? ' ≈' : '';
+      if (s.url && s.url.startsWith('http')) {
+        return `<a href="${esc(s.url)}" target="_blank" rel="noopener"
+          style="display:inline-flex;align-items:center;gap:4px;background:${col};color:white;
+          font-size:10.5px;padding:3px 9px;border-radius:20px;text-decoration:none;margin:2px;font-family:DM Sans">
+          <svg width="9" height="9" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+          ${esc(s.title || s.type)}${approx}
+        </a>`;
+      }
+      return `<span style="display:inline-flex;align-items:center;gap:4px;background:${col}22;color:${col};
+        border:1px solid ${col}44;font-size:10.5px;padding:3px 9px;border-radius:20px;margin:2px;font-family:DM Sans">
+        ${esc(s.title || s.type)}${approx}
+      </span>`;
+    }).join('');
+    return `<div style="margin-top:7px;display:flex;flex-wrap:wrap;gap:2px">${chips}</div>`;
+  }
+
+  // ── Incident Log ────────────────────────────────────────────────────────
+  const incidents = a.incident_log || a.non_compliance_findings || [];
+  const incidentRows = incidents.map((inc, idx) => {
+    const detailId = `inc-detail-${idx}`;
+    const sevColor = { High: '#ef4444', Medium: '#f59e0b', Low: '#10b981', Critical: '#7c3aed' };
+    const classColor = { Regulatory: '#0f2d5a', Governance: '#1d4ed8', Financial: '#dc2626', ESG: '#059669' };
+    const sev = inc.severity || 'Medium';
+    const cls = inc.classification || 'Regulatory';
+    const sources = inc.sources || inc.legal_references || [];
+    return `
+    <div style="border:1px solid #e4e8f0;border-radius:10px;margin-bottom:10px;overflow:hidden">
+      <!-- Row header — always visible -->
+      <div onclick="toggleRefs('${detailId}')" style="display:flex;align-items:flex-start;gap:12px;padding:12px 14px;cursor:pointer;background:#fafbfc;transition:background .15s"
+        onmouseover="this.style.background='#f1f5f9'" onmouseout="this.style.background='#fafbfc'">
+        <div style="width:26px;height:26px;border-radius:50%;background:${sevColor[sev]||'#475569'};color:white;
+          display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;flex-shrink:0;font-family:Outfit">
+          ${idx + 1}
+        </div>
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:4px">
+            <span style="font-weight:700;font-size:13px;color:#0f172a">${esc(inc.nature || inc.finding || 'Incident')}</span>
+            <span style="font-size:10px;padding:2px 8px;border-radius:20px;background:${sevColor[sev]||'#475569'}20;color:${sevColor[sev]||'#475569'};font-weight:700">${sev}</span>
+            <span style="font-size:10px;padding:2px 8px;border-radius:20px;background:${classColor[cls]||'#47556920'};color:${classColor[cls]||'#475569'};font-weight:600">${cls}</span>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:12px;font-size:11.5px;color:#64748b">
+            ${inc.date ? `<span>📅 ${esc(inc.date)}</span>` : ''}
+            ${inc.regulator ? `<span>🏛 ${esc(inc.regulator)}</span>` : ''}
+            ${inc.penalty_action ? `<span style="color:#dc2626;font-weight:600">⚖ ${esc(inc.penalty_action)}</span>` : ''}
+          </div>
+        </div>
+        <svg id="${detailId}-chevron" width="16" height="16" fill="none" stroke="#94a3b8" stroke-width="2" viewBox="0 0 24 24" style="flex-shrink:0;transition:transform .2s"><path d="M9 18l6-6-6-6"/></svg>
+      </div>
+      <!-- Expandable detail panel -->
+      <div id="${detailId}" style="display:none;padding:14px;border-top:1px solid #e4e8f0;background:white">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
+          ${inc.business_implication ? `<div>
+            <div style="font-size:10.5px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">Business Implication</div>
+            <div style="font-size:12.5px;color:#334155;line-height:1.5">${esc(inc.business_implication)}</div>
+          </div>` : ''}
+          ${inc.root_cause ? `<div>
+            <div style="font-size:10.5px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">
+              Root Cause ${inc.root_cause_inferred ? '<span style="color:#f59e0b;font-size:9.5px">[INFERRED]</span>' : ''}
+            </div>
+            <div style="font-size:12.5px;color:#334155;line-height:1.5">${esc(inc.root_cause)}</div>
+          </div>` : ''}
+        </div>
+        ${inc.severity_rationale ? `<div style="margin-bottom:10px;padding:8px 12px;background:#fef3c7;border-left:3px solid #f59e0b;border-radius:0 6px 6px 0">
+          <div style="font-size:10.5px;font-weight:700;color:#92400e;margin-bottom:2px">Severity Rationale</div>
+          <div style="font-size:12px;color:#78350f">${esc(inc.severity_rationale)}</div>
+        </div>` : ''}
+        ${inc.legal_section ? `<div style="margin-bottom:10px;padding:7px 12px;background:#f0f4ff;border-left:3px solid #0f2d5a;border-radius:0 6px 6px 0">
+          <div style="font-size:10.5px;font-weight:700;color:#0f2d5a;margin-bottom:2px">Primary Legal Provision</div>
+          <div style="font-size:11.5px;color:#1e3a5f;font-family:monospace">${esc(inc.legal_section)}</div>
+        </div>` : ''}
+        ${inc.remediation ? `<div style="font-size:12.5px;color:#475569;margin-bottom:10px">
+          <span style="font-weight:700;color:#0f172a">→ Action: </span>${esc(inc.remediation)}
+        </div>` : ''}
+        <!-- Sources -->
+        <div>
+          <div style="font-size:10.5px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px">
+            📚 Sources & References
+          </div>
+          ${sources.length ? renderSources(sources, detailId) :
+            '<span style="font-size:11.5px;color:#94a3b8;font-style:italic">No sources available — rerun analysis for updated references</span>'}
         </div>
       </div>
-      <div class="finding-meta">
-        ${f.section ? `<span>§ ${esc(f.section)}</span>` : ''}
-        ${f.consequence ? `<span style="color:#ef4444">⚠ ${esc(f.consequence)}</span>` : ''}
-      </div>
-      ${f.remediation ? `<div class="finding-body">→ ${esc(f.remediation)}</div>` : ''}
-    </div>
-  `).join('') || '<p style="color:#64748b;font-size:13px">No specific non-compliance findings. Maintain current practices.</p>';
+    </div>`;
+  }).join('') || '<p style="color:#64748b;font-size:13px">No incidents found. Run analysis to detect compliance issues.</p>';
 
+  // ── Repeat Violations ───────────────────────────────────────────────────
+  const repeats = a.repeat_violations || [];
+  const repeatHtml = repeats.length ? repeats.map(r => `
+    <div style="border-left:4px solid #dc2626;padding:10px 14px;background:#fef2f2;border-radius:0 8px 8px 0;margin-bottom:8px">
+      <div style="font-weight:700;font-size:13px;color:#991b1b;margin-bottom:4px">
+        🔁 ${esc(r.violation)}
+      </div>
+      <div style="display:flex;gap:16px;font-size:11.5px;margin-bottom:6px;flex-wrap:wrap">
+        <span style="color:#64748b"><b>First:</b> ${esc(r.first_occurrence)}</span>
+        <span style="color:#dc2626"><b>Recurred:</b> ${esc(r.recurrence)}</span>
+      </div>
+      ${r.pattern_analysis ? `<div style="font-size:12px;color:#7f1d1d;line-height:1.5">${esc(r.pattern_analysis)}</div>` : ''}
+    </div>
+  `).join('') : '<p style="color:#64748b;font-size:13px">No repeat violations identified.</p>';
+
+  // ── Systemic Weaknesses ─────────────────────────────────────────────────
+  const weaknesses = a.systemic_weaknesses || [];
+  const weaknessHtml = weaknesses.length ? weaknesses.map(w => `
+    <div style="border:1px solid #fbbf24;border-radius:8px;padding:12px 14px;margin-bottom:8px;background:#fffbeb">
+      <div style="font-weight:700;font-size:13px;color:#92400e;margin-bottom:5px">⚠ ${esc(w.area)}</div>
+      <div style="font-size:12.5px;color:#78350f;line-height:1.5">${esc(w.weakness)}</div>
+      ${w.related_incident_ids?.length ? `<div style="margin-top:6px;font-size:11px;color:#b45309">
+        Related incidents: ${w.related_incident_ids.map(id => `<span style="background:#fde68a;padding:1px 7px;border-radius:10px;margin-right:4px">#${id}</span>`).join('')}
+      </div>` : ''}
+    </div>
+  `).join('') : '<p style="color:#64748b;font-size:13px">No systemic weaknesses identified.</p>';
+
+  // ── Key Risk Themes ─────────────────────────────────────────────────────
+  const themes = a.key_risk_themes || [];
+  const themeColors = ['#ef4444','#f59e0b','#3b82f6','#8b5cf6','#10b981'];
+  const themeHtml = themes.length ? themes.map((t, i) => `
+    <div style="border-left:4px solid ${themeColors[i%5]};padding:10px 14px;margin-bottom:8px;background:#f8fafc;border-radius:0 8px 8px 0">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">
+        <span style="width:22px;height:22px;border-radius:50%;background:${themeColors[i%5]};color:white;
+          font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center;font-family:Outfit;flex-shrink:0">${t.rank||i+1}</span>
+        <span style="font-weight:700;font-size:13px;color:#0f172a">${esc(t.theme)}</span>
+      </div>
+      <div style="font-size:12.5px;color:#475569;line-height:1.6;padding-left:30px">${esc(t.description)}</div>
+      ${t.related_incident_ids?.length ? `<div style="margin-top:5px;padding-left:30px;font-size:11px;color:#94a3b8">
+        Cases: ${t.related_incident_ids.map(id => `<span style="background:#e2e8f0;padding:1px 7px;border-radius:10px;margin-right:4px">#${id}</span>`).join('')}
+      </div>` : ''}
+    </div>
+  `).join('') : '';
+
+  // ── Early Warnings ──────────────────────────────────────────────────────
+  const warnings = (a.early_warning_signals || []).map((w, wi) => {
+    const wRefs = w.legal_references || [];
+    const wRefId = `refs-w-${wi}`;
+    return `
+    <div class="warning-box" style="margin-bottom:8px;margin-top:0;flex-direction:column;gap:6px">
+      <div style="display:flex;align-items:flex-start;gap:8px">
+        <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="width:16px;height:16px;flex-shrink:0;margin-top:2px"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+        <div style="flex:1">
+          <div style="font-weight:600;font-size:13px">${esc(w.signal || w)}</div>
+          ${w.recommended_action ? `<div style="font-size:12px;margin-top:3px;opacity:.85">Action: ${esc(w.recommended_action)}</div>` : ''}
+          ${w.timeline ? `<div style="font-size:11px;margin-top:2px;opacity:.7">Timeline: ${esc(w.timeline)}</div>` : ''}
+        </div>
+      </div>
+      ${wRefs.length ? `
+      <div style="padding-left:24px">
+        <button onclick="toggleRefs('${wRefId}')" style="background:none;border:1px solid rgba(180,130,0,.5);color:rgba(100,70,0,.9);font-size:11px;padding:2px 9px;border-radius:20px;cursor:pointer;font-family:DM Sans;display:inline-flex;align-items:center;gap:4px">
+          📚 ${wRefs.length} Reference${wRefs.length > 1 ? 's' : ''}
+        </button>
+        <div id="${wRefId}" style="display:none;margin-top:6px;background:rgba(255,255,255,.4);border:1px solid rgba(180,130,0,.3);border-radius:6px;padding:8px">
+          ${wRefs.map((r, i) => `
+            <div style="${i > 0 ? 'border-top:1px solid rgba(180,130,0,.2);margin-top:6px;padding-top:6px' : ''}">
+              <div style="font-size:11px;font-weight:700;font-family:monospace">${esc(r.citation)}</div>
+              ${r.description ? `<div style="font-size:11px;margin-top:2px;opacity:.8">${esc(r.description)}</div>` : ''}
+              ${r.url ? `<a href="${esc(r.url)}" target="_blank" style="font-size:10.5px;color:#1d4ed8;margin-top:3px;display:inline-block">↗ Open source</a>` : ''}
+            </div>
+          `).join('')}
+        </div>
+      </div>` : ''}
+    </div>`;
+  }).join('') || '<p style="color:#64748b;font-size:13px">No early warning signals identified.</p>';
+
+  // ── Priorities ──────────────────────────────────────────────────────────
   const priorities = (a.regulatory_priorities || []).map((p, i) => `
     <div style="display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-bottom:1px solid #e4e8f0">
-      <div style="width:28px;height:28px;background:${i < 2 ? '#ef4444' : i < 4 ? '#f59e0b' : '#10b981'};color:white;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:Outfit;font-weight:800;font-size:13px;flex-shrink:0">${i+1}</div>
+      <div style="width:28px;height:28px;background:${i<2?'#ef4444':i<4?'#f59e0b':'#10b981'};color:white;border-radius:50%;display:flex;align-items:center;justify-content:center;font-family:Outfit;font-weight:800;font-size:13px;flex-shrink:0">${i+1}</div>
       <div style="flex:1">
-        <div style="font-size:13px;font-weight:600">${esc(p.action || p)}</div>
-        <div style="font-size:11.5px;color:#64748b;margin-top:2px">
-          ${p.framework ? `<span class="badge badge-navy" style="font-size:10px">${esc(p.framework)}</span> ` : ''}
-          ${p.deadline ? `📅 ${esc(p.deadline)}` : ''}
-          ${p.owner ? ` · 👤 ${esc(p.owner)}` : ''}
+        <div style="font-size:13px;font-weight:600">${esc(p.action||p)}</div>
+        <div style="font-size:11.5px;color:#64748b;margin-top:2px;display:flex;flex-wrap:wrap;gap:8px">
+          ${p.framework ? `<span class="badge badge-navy" style="font-size:10px">${esc(p.framework)}</span>` : ''}
+          ${p.deadline ? `<span>📅 ${esc(p.deadline)}</span>` : ''}
+          ${p.owner ? `<span>👤 ${esc(p.owner)}</span>` : ''}
         </div>
+        ${p.legal_reference ? `<div style="margin-top:5px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          <span style="font-size:10.5px;color:#0f2d5a;font-family:monospace;background:#f0f4ff;padding:2px 8px;border-radius:4px">§ ${esc(p.legal_reference)}</span>
+          ${p.reference_url ? `<a href="${esc(p.reference_url)}" target="_blank" rel="noopener" style="font-size:10.5px;color:#1d4ed8">↗ View regulation</a>` : ''}
+        </div>` : ''}
       </div>
     </div>
   `).join('');
 
-  const warnings = (a.early_warning_signals || []).map(w => `
-    <div class="warning-box" style="margin-bottom:8px;margin-top:0">
-      <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" style="width:16px;height:16px;flex-shrink:0"><path d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
-      <div>
-        <div style="font-weight:600;font-size:13px">${esc(w.signal || w)}</div>
-        ${w.recommended_action ? `<div style="font-size:12px;margin-top:3px;opacity:0.8">Action: ${esc(w.recommended_action)}</div>` : ''}
-        ${w.timeline ? `<div style="font-size:11px;margin-top:2px;opacity:0.7">Timeline: ${esc(w.timeline)}</div>` : ''}
+  // ── Recommendations ─────────────────────────────────────────────────────
+  const recsHtml = (a.recommendations||[]).map((r, ri) => `
+    <div class="finding-card ${r.priority==='Immediate'?'':r.priority==='Short-term'?'medium':'low'}" style="margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;gap:8px">
+        <span style="font-weight:600;font-size:13px">${esc(r.category||'')}</span>
+        <span class="badge ${r.priority==='Immediate'?'badge-danger':r.priority==='Short-term'?'badge-warning':'badge-success'}">${esc(r.priority||'')}</span>
       </div>
+      <div style="font-size:12.5px;color:#475569;margin-top:5px;line-height:1.5">${esc(r.recommendation||r)}</div>
+      ${r.legal_basis ? `<div style="margin-top:7px;padding:6px 10px;background:#f0f4ff;border-left:3px solid #0f2d5a;border-radius:0 6px 6px 0">
+        <div style="font-size:10.5px;font-weight:700;color:#0f2d5a;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px">Legal Basis</div>
+        <div style="font-size:11px;color:#1e3a5f;font-family:monospace;line-height:1.5">${esc(r.legal_basis)}</div>
+      </div>` : ''}
+      ${r.reference_url ? `<a href="${esc(r.reference_url)}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;gap:4px;margin-top:7px;font-size:11.5px;color:#1d4ed8;text-decoration:none">
+        <svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+        View regulatory guidance
+      </a>` : ''}
     </div>
-  `).join('') || '<p style="color:#64748b;font-size:13px">No early warning signals identified.</p>';
+  `).join('') || '<p style="color:#64748b;font-size:13px">No specific recommendations.</p>';
 
+  // ── Assemble the full output ────────────────────────────────────────────
   document.getElementById('analysis-content').innerHTML = `
-    <div style="margin-bottom:16px;display:flex;align-items:center;gap:10px">
+    <!-- Header bar -->
+    <div style="margin-bottom:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
       <span class="ai-badge">
         <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
         GPT-4o Analysis
       </span>
+      ${data.web_research_used ? `<span style="font-size:11.5px;background:#dcfce7;color:#15803d;padding:2px 10px;border-radius:20px;font-weight:600">🌐 Web-researched</span>` : ''}
       <span style="font-size:12.5px;color:#64748b">${data.company_name} · ${new Date(data.created_at).toLocaleString('en-IN')}</span>
-      <span style="font-size:12.5px;color:#64748b">· ${data.items_analyzed || 0} items analyzed</span>
+      <span style="font-size:12.5px;color:#64748b">· ${data.items_analyzed||0} internal items</span>
     </div>
 
-    <!-- Risk Header -->
+    <!-- Risk Score Header -->
     <div class="card" style="margin-bottom:20px">
       <div class="card-body" style="padding:24px">
         <div style="display:flex;align-items:center;gap:24px;flex-wrap:wrap">
@@ -728,21 +1147,26 @@ function renderAnalysis(data) {
               <svg width="100" height="100" viewBox="0 0 100 100">
                 <circle cx="50" cy="50" r="40" fill="none" stroke="#e4e8f0" stroke-width="8"/>
                 <circle cx="50" cy="50" r="40" fill="none" stroke="${rc}" stroke-width="8"
-                  stroke-dasharray="${2 * Math.PI * 40}"
-                  stroke-dashoffset="${2 * Math.PI * 40 * (1 - (a.overall_score || 0) / 100)}"
+                  stroke-dasharray="${2*Math.PI*40}"
+                  stroke-dashoffset="${2*Math.PI*40*(1-(a.overall_score||0)/100)}"
                   stroke-linecap="round"/>
               </svg>
-              <div class="score-num">${a.overall_score || 0}</div>
+              <div class="score-num">${a.overall_score||0}</div>
             </div>
             <div class="score-label">Health Score</div>
           </div>
           <div style="flex:1">
-            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-              <span style="font-family:Outfit;font-size:22px;font-weight:800;color:${rc}">${a.risk_level || 'N/A'} Risk</span>
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap">
+              <span style="font-family:Outfit;font-size:22px;font-weight:800;color:${rc}">${a.risk_level||'N/A'} Risk</span>
               <span class="badge risk-${(a.risk_level||'').toLowerCase()}">${a.risk_level}</span>
+              ${a.total_incidents ? `<span class="badge badge-danger">${a.total_incidents} incidents identified</span>` : ''}
             </div>
-            <p style="font-size:13.5px;color:#475569;line-height:1.6">${esc(a.risk_summary || 'Analysis complete.')}</p>
-            ${(a.strengths||[]).length ? `<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
+            <p style="font-size:13.5px;color:#475569;line-height:1.6">${esc(a.risk_summary||'Analysis complete.')}</p>
+            ${(a.data_sources_searched||[]).length ? `<div style="margin-top:8px">
+              <span style="font-size:11px;color:#94a3b8;font-weight:600">Sources searched: </span>
+              ${a.data_sources_searched.map(s => `<span style="font-size:11px;background:#f1f5f9;color:#475569;padding:2px 8px;border-radius:10px;margin:2px;display:inline-block">${esc(s)}</span>`).join('')}
+            </div>` : ''}
+            ${(a.strengths||[]).length ? `<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">
               ${a.strengths.map(s => `<span class="badge badge-success">✓ ${esc(s)}</span>`).join('')}
             </div>` : ''}
           </div>
@@ -750,50 +1174,80 @@ function renderAnalysis(data) {
       </div>
     </div>
 
-    <div class="grid-2" style="margin-bottom:20px">
-      <!-- Findings -->
-      <div class="card">
-        <div class="card-header">
-          <h3>Non-Compliance Findings</h3>
-          <span class="badge badge-danger">${(a.non_compliance_findings||[]).length} issues</span>
+    <!-- Incident Log (9-field framework table) -->
+    <div class="card" style="margin-bottom:20px">
+      <div class="card-header">
+        <h3>Compliance Incident Log</h3>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span style="font-size:11px;color:#94a3b8">Click any row to expand details & sources</span>
+          <span class="badge badge-danger">${incidents.length} incident${incidents.length!==1?'s':''}</span>
         </div>
-        <div class="card-body" style="max-height:380px;overflow-y:auto">${findings}</div>
       </div>
+      <div class="card-body">${incidentRows}</div>
+    </div>
 
-      <!-- Priorities -->
+    <!-- Repeat Violations + Systemic Weaknesses -->
+    ${(repeats.length || weaknesses.length) ? `<div class="grid-2" style="margin-bottom:20px">
+      ${repeats.length ? `<div class="card">
+        <div class="card-header">
+          <h3>Repeat Violations</h3>
+          <span class="badge badge-danger">${repeats.length} pattern${repeats.length!==1?'s':''}</span>
+        </div>
+        <div class="card-body">${repeatHtml}</div>
+      </div>` : ''}
+      ${weaknesses.length ? `<div class="card">
+        <div class="card-header">
+          <h3>Systemic Weaknesses</h3>
+          <span class="badge badge-warning">${weaknesses.length} area${weaknesses.length!==1?'s':''}</span>
+        </div>
+        <div class="card-body">${weaknessHtml}</div>
+      </div>` : ''}
+    </div>` : ''}
+
+    <!-- Key Risk Themes -->
+    ${themes.length ? `<div class="card" style="margin-bottom:20px">
+      <div class="card-header">
+        <h3>Key Risk Themes</h3>
+        <span class="badge badge-info">${themes.length} theme${themes.length!==1?'s':''}</span>
+      </div>
+      <div class="card-body">${themeHtml}</div>
+    </div>` : ''}
+
+    <!-- Priorities + Warnings -->
+    <div class="grid-2" style="margin-bottom:20px">
       <div class="card">
         <div class="card-header">
           <h3>Regulatory Priorities</h3>
           <span class="badge badge-info">Top ${(a.regulatory_priorities||[]).length}</span>
         </div>
-        <div class="card-body" style="max-height:380px;overflow-y:auto">${priorities || '<p style="color:#64748b;font-size:13px">No specific priorities identified.</p>'}</div>
-      </div>
-    </div>
-
-    <div class="grid-2" style="margin-bottom:20px">
-      <!-- Early Warnings -->
-      <div class="card">
-        <div class="card-header"><h3>Early Warning Signals</h3></div>
-        <div class="card-body">${warnings}</div>
-      </div>
-
-      <!-- Recommendations -->
-      <div class="card">
-        <div class="card-header"><h3>JHS Recommendations</h3></div>
-        <div class="card-body" style="max-height:300px;overflow-y:auto">
-          ${(a.recommendations||[]).map(r => `
-            <div class="finding-card ${r.priority==='Immediate' ? '' : r.priority==='Short-term' ? 'medium' : 'low'}" style="margin-bottom:8px">
-              <div style="display:flex;justify-content:space-between;gap:8px">
-                <span style="font-weight:600;font-size:13px">${esc(r.category || '')}</span>
-                <span class="badge ${r.priority==='Immediate'?'badge-danger':r.priority==='Short-term'?'badge-warning':'badge-success'}">${esc(r.priority || '')}</span>
-              </div>
-              <div style="font-size:12.5px;color:#475569;margin-top:5px;line-height:1.5">${esc(r.recommendation || r)}</div>
-            </div>
-          `).join('') || '<p style="color:#64748b;font-size:13px">No specific recommendations.</p>'}
+        <div class="card-body" style="max-height:360px;overflow-y:auto">
+          ${priorities || '<p style="color:#64748b;font-size:13px">No specific priorities identified.</p>'}
         </div>
       </div>
+      <div class="card">
+        <div class="card-header"><h3>Early Warning Signals</h3></div>
+        <div class="card-body" style="max-height:360px;overflow-y:auto">${warnings}</div>
+      </div>
+    </div>
+
+    <!-- Recommendations -->
+    <div class="card" style="margin-bottom:20px">
+      <div class="card-header"><h3>JHS Recommendations</h3></div>
+      <div class="card-body">${recsHtml}</div>
     </div>
   `;
+
+  // Wire up chevron rotation for incident rows
+  document.querySelectorAll('[id^="inc-detail-"]').forEach(panel => {
+    const chevron = document.getElementById(panel.id + '-chevron');
+    if (chevron) {
+      const original = panel.style.display;
+      const observer = new MutationObserver(() => {
+        chevron.style.transform = panel.style.display === 'none' ? '' : 'rotate(90deg)';
+      });
+      observer.observe(panel, { attributes: true, attributeFilter: ['style'] });
+    }
+  });
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1351,6 +1805,12 @@ async function deleteDocument(id) {
 // ─────────────────────────────────────────────────────────
 // Utilities
 // ─────────────────────────────────────────────────────────
+function toggleRefs(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
 function esc(str) {
   if (str == null) return '';
   return String(str)

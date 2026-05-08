@@ -621,48 +621,426 @@ async function seedComplianceItems() {
 // ─────────────────────────────────────────────────────────
 // AI ANALYSIS
 // ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────
+// AGENT PIPELINE CONFIG — 8 Agents, all gpt-4o
+// ─────────────────────────────────────────────────────────
+const AGENTS = [
+  { id:'orchestrator',    name:'Orchestrator',               icon:'🎯', desc:'Plans research strategy & risk areas',          color:'#0f2d5a' },
+  { id:'researcher_rbi',  name:'RBI & MCA Researcher',       icon:'🏛', desc:'RBI penalties · MCA orders · Parliamentary',    color:'#1d4ed8' },
+  { id:'researcher_sebi', name:'SEBI & Exchange Researcher', icon:'📈', desc:'SEBI orders · BSE/NSE filings · LODR',          color:'#7c3aed' },
+  { id:'researcher_tax',  name:'Tax & Media Researcher',     icon:'📰', desc:'IT Dept · GST · FEMA · Financial media',        color:'#0891b2' },
+  { id:'extractor',       name:'Data Extractor',             icon:'⚙',  desc:'Structures 9-field incident data',              color:'#d97706' },
+  { id:'verifier',        name:'Verifier & Fact-Checker',    icon:'✅', desc:'Cross-checks citations & source URLs',          color:'#059669' },
+  { id:'analyst',         name:'Pattern Analyst',            icon:'🔍', desc:'Repeat violations · Systemic weaknesses',       color:'#dc2626' },
+  { id:'reporter',        name:'Report Writer',              icon:'📝', desc:'Compiles board-ready final report',             color:'#c8a846' },
+];
+
+let pipelineSSE = null;
+
+// ─────────────────────────────────────────────────────────
+// AGENT PIPELINE UI
+// ─────────────────────────────────────────────────────────
+function buildAgentPipelineUI() {
+  const agentCards = AGENTS.map(a => `
+    <div id="agent-card-${a.id}" style="
+      border:1.5px solid #e4e8f0;border-radius:12px;padding:14px 16px;
+      background:#fff;transition:all .3s;position:relative;overflow:hidden">
+      <div style="display:flex;align-items:flex-start;gap:12px">
+        <div id="agent-icon-${a.id}" style="
+          width:40px;height:40px;border-radius:10px;background:${a.color}18;
+          display:flex;align-items:center;justify-content:center;font-size:18px;
+          flex-shrink:0;transition:all .3s">${a.icon}</div>
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:3px;flex-wrap:wrap">
+            <span style="font-weight:700;font-size:13px;color:#0f172a">${a.name}</span>
+            <span id="agent-badge-${a.id}" style="
+              font-size:10px;padding:2px 8px;border-radius:20px;font-weight:600;
+              background:#f1f5f9;color:#94a3b8">Waiting</span>
+            <span style="font-size:9.5px;padding:1px 7px;border-radius:20px;
+              background:#7c3aed15;color:#7c3aed;font-weight:600;border:1px solid #7c3aed30">GPT-4o</span>
+          </div>
+          <div style="font-size:11.5px;color:#64748b;margin-bottom:5px">${a.desc}</div>
+          <div id="agent-msg-${a.id}" style="font-size:11.5px;color:#475569;min-height:14px;line-height:1.4"></div>
+          <div id="agent-detail-${a.id}" style="font-size:11px;color:#94a3b8;margin-top:2px;min-height:12px"></div>
+        </div>
+        <div style="flex-shrink:0;display:flex;flex-direction:column;align-items:flex-end;gap:4px">
+          <div id="agent-spinner-${a.id}" style="display:none">
+            <span class="spinner" style="width:18px;height:18px;border-width:2px;border-color:${a.color}40;border-top-color:${a.color}"></span>
+          </div>
+          <div id="agent-check-${a.id}" style="display:none;color:#10b981">
+            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>
+          </div>
+          <div id="agent-error-${a.id}" style="display:none;color:#ef4444">
+            <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4m0 4h.01"/></svg>
+          </div>
+        </div>
+      </div>
+      <div id="agent-progress-${a.id}" style="
+        position:absolute;bottom:0;left:0;height:2px;width:0%;
+        background:linear-gradient(90deg,${a.color},${a.color}88);
+        transition:width 2s ease;border-radius:0 0 0 12px"></div>
+    </div>`).join('');
+
+  return `
+    <!-- Pipeline Header -->
+    <div class="card" style="margin-bottom:16px;background:linear-gradient(135deg,#0f2d5a 0%,#1e3a7a 100%);border:none">
+      <div class="card-body" style="padding:20px 24px">
+        <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px">
+          <div style="width:44px;height:44px;background:rgba(255,255,255,.12);border-radius:12px;
+            display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0">🤖</div>
+          <div style="flex:1">
+            <div style="font-family:Outfit;font-weight:800;font-size:17px;color:white;margin-bottom:3px">
+              Agentic AI Pipeline Running
+            </div>
+            <div style="font-size:12.5px;color:rgba(255,255,255,.65)" id="pipeline-headline">
+              Initialising 8 specialist agents...
+            </div>
+          </div>
+          <div style="text-align:right;flex-shrink:0">
+            <div style="font-family:Outfit;font-size:28px;font-weight:800;color:white" id="pipeline-pct">0%</div>
+            <div style="font-size:11px;color:rgba(255,255,255,.5)">complete</div>
+          </div>
+        </div>
+        <div style="background:rgba(255,255,255,.15);border-radius:8px;height:6px;overflow:hidden">
+          <div id="pipeline-bar" style="height:100%;background:linear-gradient(90deg,#c8a846,#f0d060);
+            border-radius:8px;width:0%;transition:width .6s ease"></div>
+        </div>
+        <!-- Model & source strip -->
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;flex-wrap:wrap;gap:6px">
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <span style="font-size:10px;background:rgba(124,58,237,.35);color:#c4b5fd;padding:2px 8px;border-radius:10px;font-weight:600">GPT-4o · All Agents</span>
+            <span style="font-size:10px;background:rgba(29,78,216,.35);color:#93c5fd;padding:2px 8px;border-radius:10px;font-weight:600">3 Parallel Web Searches</span>
+            <span style="font-size:10px;background:rgba(8,145,178,.35);color:#67e8f9;padding:2px 8px;border-radius:10px;font-weight:600">RBI · SEBI · MCA · Tax · Media</span>
+          </div>
+          <span style="font-size:10.5px;color:rgba(255,255,255,.5)">Always fresh · No cache</span>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- Agent Cards Grid -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px" id="agent-cards-grid">
+      ${agentCards}
+    </div>
+
+    <!-- Live Feed -->
+    <div class="card">
+      <div class="card-header" style="border-bottom:1px solid #e4e8f0">
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="width:8px;height:8px;background:#10b981;border-radius:50%;display:inline-block;animation:pulse 1.5s infinite"></span>
+          <h3 style="margin:0">Live Agent Feed</h3>
+        </div>
+        <span id="live-feed-count" style="font-size:11.5px;color:#94a3b8">0 events</span>
+      </div>
+      <div id="live-feed" style="
+        max-height:200px;overflow-y:auto;padding:12px 16px;
+        font-family:monospace;font-size:11.5px;color:#334155;
+        background:#f8fafc;border-radius:0 0 12px 12px"></div>
+    </div>`;
+}
+
+function updateAgentCard(agentId, status, message, detail) {
+  const card  = document.getElementById(`agent-card-${agentId}`);
+  const badge = document.getElementById(`agent-badge-${agentId}`);
+  const msg   = document.getElementById(`agent-msg-${agentId}`);
+  const det   = document.getElementById(`agent-detail-${agentId}`);
+  const spin  = document.getElementById(`agent-spinner-${agentId}`);
+  const check = document.getElementById(`agent-check-${agentId}`);
+  const err   = document.getElementById(`agent-error-${agentId}`);
+  const prog  = document.getElementById(`agent-progress-${agentId}`);
+  const icon  = document.getElementById(`agent-icon-${agentId}`);
+  const agent = AGENTS.find(a => a.id === agentId);
+  if (!card || !agent) {
+    console.warn(`[CSI] updateAgentCard: card not found for agent "${agentId}" — DOM may not be ready`);
+    return;
+  }
+
+  spin.style.display = 'none';
+  check.style.display = 'none';
+  err.style.display = 'none';
+
+  if (status === 'running') {
+    card.style.borderColor = agent.color + '60';
+    card.style.background  = agent.color + '05';
+    icon.style.background  = agent.color + '25';
+    badge.style.background = agent.color + '18';
+    badge.style.color      = agent.color;
+    badge.textContent      = 'Running';
+    spin.style.display     = 'block';
+    prog.style.width       = '60%';
+  } else if (status === 'done') {
+    card.style.borderColor = '#10b981' + '60';
+    card.style.background  = '#10b98108';
+    badge.style.background = '#dcfce7';
+    badge.style.color      = '#059669';
+    badge.textContent      = '✓ Done';
+    check.style.display    = 'block';
+    prog.style.width       = '100%';
+    prog.style.background  = 'linear-gradient(90deg,#10b981,#34d399)';
+  } else if (status === 'error') {
+    card.style.borderColor = '#ef444460';
+    badge.style.background = '#fee2e2';
+    badge.style.color      = '#dc2626';
+    badge.textContent      = '✗ Error';
+    err.style.display      = 'block';
+    prog.style.width       = '100%';
+    prog.style.background  = '#ef4444';
+  }
+  if (message) msg.textContent = message;
+  if (detail)  det.textContent = detail;
+}
+
+function addLiveFeedEntry(timestamp, text, type='info') {
+  const feed  = document.getElementById('live-feed');
+  const count = document.getElementById('live-feed-count');
+  if (!feed) return;
+  const colors = { info:'#475569', success:'#059669', error:'#dc2626', agent:'#0f2d5a' };
+  const line   = document.createElement('div');
+  line.style.cssText = `padding:2px 0;border-bottom:1px solid #e4e8f0;color:${colors[type]||colors.info}`;
+  line.innerHTML = `<span style="color:#94a3b8;margin-right:8px">[${timestamp}]</span>${esc(text)}`;
+  feed.appendChild(line);
+  feed.scrollTop = feed.scrollHeight;
+  const n = feed.querySelectorAll('div').length;
+  if (count) count.textContent = `${n} event${n!==1?'s':''}`;
+}
+
+function updatePipelineProgress() {
+  const doneCount = AGENTS.filter(a => {
+    const b = document.getElementById(`agent-badge-${a.id}`);
+    return b && b.textContent.includes('Done');
+  }).length;
+  const pct = Math.round((doneCount / AGENTS.length) * 100);
+  const bar = document.getElementById('pipeline-bar');
+  const pctEl = document.getElementById('pipeline-pct');
+  const headline = document.getElementById('pipeline-headline');
+  if (bar) bar.style.width = pct + '%';
+  if (pctEl) pctEl.textContent = pct + '%';
+  if (headline && doneCount > 0) {
+    const phase = doneCount <= 1 ? 'Scoping & planning...'
+                : doneCount <= 4 ? 'Researching regulatory sources...'
+                : doneCount <= 5 ? 'Extracting & structuring data...'
+                : doneCount <= 6 ? 'Verifying facts & citations...'
+                : doneCount <= 7 ? 'Analysing patterns & themes...'
+                : 'Compiling final report...';
+    headline.textContent = phase;
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// RUN ANALYSIS (SSE Agent Pipeline)
+// ─────────────────────────────────────────────────────────
 async function runAnalysis() {
   const cid = document.getElementById('analysis-company-sel').value;
   if (!cid) { toast('Please select a company', 'error'); return; }
 
   const btn = document.getElementById('btn-run-analysis');
   btn.disabled = true;
-  btn.innerHTML = `<span class="spinner"></span> Analyzing...`;
+  btn.innerHTML = `<span class="spinner"></span> Agents Running...`;
 
-  document.getElementById('analysis-content').innerHTML = `
-    <div class="loading-overlay">
-      <div class="spinner spinner-navy" style="width:36px;height:36px;border-width:3px"></div>
-      <p>GPT-4o is analyzing compliance data...</p>
-      <p style="font-size:12px;margin-top:-8px">This may take 20–40 seconds</p>
-    </div>`;
+  // Close any existing SSE connection
+  if (pipelineSSE) { pipelineSSE.close(); pipelineSSE = null; }
 
-  try {
-    const data = await apiPost('/api/analysis', { company_id: cid });
-    renderAnalysis(data);
-    toast('Analysis complete', 'success');
-  } catch (e) {
-    document.getElementById('analysis-content').innerHTML = `
-      <div class="empty-state">
-        <svg fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4m0 4h.01"/></svg>
-        <h3>Analysis Failed</h3>
-        <p>${esc(e.message)}</p>
-      </div>`;
-    toast('Analysis failed: ' + e.message, 'error');
-  } finally {
+  // Render the agent pipeline UI
+  document.getElementById('analysis-content').innerHTML = buildAgentPipelineUI();
+
+  // ── CRITICAL: wait for the DOM to fully render before opening SSE ──────
+  // Without this, early agent events (orchestrator, researchers) arrive
+  // before getElementById can find the cards, so they silently fail and
+  // cards stay "Waiting" forever even though the agents completed.
+  await new Promise(resolve => {
+    requestAnimationFrame(() => setTimeout(resolve, 250));
+  });
+
+  // Now the DOM is ready — open SSE connection
+  pipelineSSE = new EventSource(`/api/analysis/stream?company_id=${encodeURIComponent(cid)}`);
+
+  pipelineSSE.onmessage = (event) => {
+    try {
+      const ev = JSON.parse(event.data);
+
+      if (ev.type === 'agent_update') {
+        updateAgentCard(ev.agent_id, ev.status, ev.message, ev.detail);
+        updatePipelineProgress();
+        if (ev.status === 'running') {
+          addLiveFeedEntry(ev.timestamp, `[${ev.agent_id}] ${ev.message}`, 'agent');
+        } else if (ev.status === 'done') {
+          addLiveFeedEntry(ev.timestamp, `✓ ${ev.agent_id}: ${ev.message}`, 'success');
+        } else if (ev.status === 'error') {
+          addLiveFeedEntry(ev.timestamp, `✗ ${ev.agent_id}: ${ev.message}`, 'error');
+        }
+
+      } else if (ev.type === 'log') {
+        addLiveFeedEntry(ev.timestamp, ev.text, 'info');
+
+      } else if (ev.type === 'complete') {
+        pipelineSSE.close(); pipelineSSE = null;
+        updatePipelineProgress();
+        const cached = ev.cached;
+        const cacheMsg = cached ? `⚡ Cache hit — served ${ev.cache_age_minutes}-min-old result ($0 cost)` : '🎉 Pipeline complete — all agents done!';
+        addLiveFeedEntry(ev.timestamp, cacheMsg, 'success');
+        toast(cached ? `Loaded from cache (${ev.cache_age_minutes} min old) — $0 cost` : 'Analysis complete!', 'success');
+        setTimeout(() => {
+          document.getElementById('analysis-content').innerHTML = '';
+          renderAnalysis(ev.data);
+          // Show cache banner if applicable
+          if (cached) {
+            const content = document.getElementById('analysis-content');
+            const banner  = document.createElement('div');
+            banner.style.cssText = 'background:#f0fdf4;border:1px solid #86efac;border-radius:10px;padding:10px 16px;margin-bottom:16px;display:flex;align-items:center;gap:10px;font-size:13px;color:#15803d';
+            banner.innerHTML = `<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+              <span><strong>Served from cache</strong> — ${ev.cache_age_minutes} min old · <strong>$0 API cost</strong> · Fresh analysis available after 6 hours</span>`;
+            content.insertBefore(banner, content.firstChild);
+          }
+        }, cached ? 200 : 1200);
+
+      } else if (ev.type === 'error') {
+        pipelineSSE.close(); pipelineSSE = null;
+        addLiveFeedEntry(ev.timestamp || '??:??:??', `Pipeline error: ${ev.message}`, 'error');
+        toast('Analysis failed: ' + ev.message, 'error');
+        document.getElementById('analysis-content').innerHTML = `
+          <div class="empty-state">
+            <svg fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4m0 4h.01"/></svg>
+            <h3>Pipeline Error</h3><p>${esc(ev.message)}</p>
+          </div>`;
+      }
+    } catch(e) {
+      console.error('SSE parse error:', e);
+    }
+  };
+
+  pipelineSSE.onerror = (e) => {
+    console.error('SSE connection error:', e);
+    addLiveFeedEntry(new Date().toTimeString().slice(0,8), 'Connection interrupted — check server', 'error');
+  };
+
+  // Reset button once SSE closes
+  const resetBtn = () => {
     btn.disabled = false;
     btn.innerHTML = `<svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg> Run Analysis`;
-  }
+  };
+  pipelineSSE.addEventListener('error', resetBtn);
+  // Also reset if SSE ends cleanly
+  const checkDone = setInterval(() => {
+    if (!pipelineSSE || pipelineSSE.readyState === EventSource.CLOSED) {
+      resetBtn(); clearInterval(checkDone);
+    }
+  }, 2000);
 }
 
 async function loadAnalysisHistory() {
   const cid = document.getElementById('analysis-company-sel').value;
-  if (!cid && !state.globalCompany) return;
-  const url = `/api/analysis${cid ? '?company_id='+cid : (state.globalCompany ? '?company_id='+state.globalCompany : '')}`;
-  const items = await apiFetch(url).catch(() => []);
-  if (items.length) renderAnalysis(items[0]);
+  const effectiveCid = cid || state.globalCompany;
+
+  // Always show a fresh-start prompt — never silently render stale data.
+  // User must explicitly click "Run Analysis" or "View Last Analysis".
+  let lastAnalysis = null;
+  if (effectiveCid) {
+    const items = await apiFetch(`/api/analysis?company_id=${effectiveCid}`).catch(() => []);
+    if (items.length) lastAnalysis = items[0];
+  }
+
+  const el = document.getElementById('analysis-content');
+  if (!el) return;
+
+  if (lastAnalysis) {
+    const lastDate  = new Date(lastAnalysis.created_at);
+    const minsAgo   = Math.round((Date.now() - lastDate) / 60000);
+    const timeLabel = minsAgo < 60
+      ? `${minsAgo} minute${minsAgo !== 1 ? 's' : ''} ago`
+      : minsAgo < 1440
+        ? `${Math.round(minsAgo/60)} hour${Math.round(minsAgo/60) !== 1 ? 's' : ''} ago`
+        : lastDate.toLocaleDateString('en-IN', {day:'2-digit',month:'short',year:'numeric'});
+
+    // Stale if older than 2 hours
+    const isStale = minsAgo > 120;
+
+    el.innerHTML = `
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+        padding:60px 24px;text-align:center;max-width:560px;margin:0 auto">
+        <div style="width:64px;height:64px;background:#f0f4ff;border-radius:16px;
+          display:flex;align-items:center;justify-content:center;margin-bottom:20px">
+          <svg width="30" height="30" fill="none" stroke="#0f2d5a" stroke-width="1.8" viewBox="0 0 24 24">
+            <path d="M13 10V3L4 14h7v7l9-11h-7z"/>
+          </svg>
+        </div>
+        <h2 style="font-family:Outfit;font-size:20px;font-weight:800;color:#0f2d5a;margin-bottom:8px">
+          Run Fresh Analysis
+        </h2>
+        <p style="font-size:13.5px;color:#64748b;line-height:1.6;margin-bottom:20px">
+          Click <strong>Run Analysis</strong> above to launch the 8-agent AI pipeline and fetch the
+          latest compliance data from RBI, SEBI, MCA, and financial media.
+        </p>
+
+        <!-- Last analysis notice -->
+        <div style="width:100%;background:${isStale ? '#fef3c7' : '#f0fdf4'};
+          border:1px solid ${isStale ? '#fde68a' : '#bbf7d0'};
+          border-radius:10px;padding:14px 18px;margin-bottom:20px;text-align:left">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+            <span style="font-size:13px;font-weight:700;color:${isStale ? '#92400e' : '#15803d'}">
+              ${isStale ? '⚠ Previous Analysis (Outdated)' : '✓ Recent Analysis Available'}
+            </span>
+            <span style="font-size:11px;color:${isStale ? '#b45309' : '#16a34a'};
+              background:${isStale ? '#fde68a' : '#dcfce7'};
+              padding:1px 8px;border-radius:10px">${timeLabel}</span>
+          </div>
+          <div style="font-size:12.5px;color:#475569;line-height:1.5">
+            ${lastAnalysis.company_name} ·
+            ${lastAnalysis.analysis?.risk_level || '?'} Risk ·
+            ${lastAnalysis.analysis?.total_incidents || (lastAnalysis.analysis?.incident_log||[]).length} incidents ·
+            ${lastAnalysis.items_analyzed || 0} internal items
+          </div>
+          <button onclick="viewLastAnalysis()"
+            style="margin-top:10px;background:none;border:1px solid ${isStale ? '#f59e0b' : '#10b981'};
+            color:${isStale ? '#92400e' : '#059669'};font-size:12px;padding:4px 14px;
+            border-radius:20px;cursor:pointer;font-family:DM Sans">
+            View Last Analysis →
+          </button>
+        </div>
+
+        <p style="font-size:12px;color:#94a3b8">
+          Each run performs live web searches across 8+ regulatory sources.
+          Results are always fresh — never cached.
+        </p>
+      </div>`;
+
+    // Store for "View Last Analysis" button
+    state._lastAnalysisData = lastAnalysis;
+
+  } else {
+    // No previous analysis at all
+    el.innerHTML = `
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+        padding:80px 24px;text-align:center">
+        <div style="width:64px;height:64px;background:#f0f4ff;border-radius:16px;
+          display:flex;align-items:center;justify-content:center;margin-bottom:20px">
+          <svg width="30" height="30" fill="none" stroke="#0f2d5a" stroke-width="1.8" viewBox="0 0 24 24">
+            <path d="M13 10V3L4 14h7v7l9-11h-7z"/>
+          </svg>
+        </div>
+        <h2 style="font-family:Outfit;font-size:20px;font-weight:800;color:#0f2d5a;margin-bottom:8px">
+          No Analysis Yet
+        </h2>
+        <p style="font-size:13.5px;color:#64748b;line-height:1.6">
+          Select a company and click <strong>Run Analysis</strong> to start the agentic AI pipeline.
+        </p>
+      </div>`;
+  }
 }
 
+function viewLastAnalysis() {
+  if (state._lastAnalysisData) {
+    renderAnalysis(state._lastAnalysisData);
+  }
+}
+
+
+
 function renderAnalysis(data) {
+  // Store a deep copy in state so chat bot can read + mutate it live
+  state.currentAnalysis = JSON.parse(JSON.stringify(data));
+  state.chatHistory     = [];   // reset chat for new analysis
+
   const a = data.analysis || {};
   const riskColor = { High: '#ef4444', Medium: '#f59e0b', Low: '#10b981' };
   const rc = riskColor[a.risk_level] || '#64748b';
@@ -989,13 +1367,248 @@ function renderAnalysis(data) {
   document.querySelectorAll('[id^="inc-detail-"]').forEach(panel => {
     const chevron = document.getElementById(panel.id + '-chevron');
     if (chevron) {
-      const original = panel.style.display;
       const observer = new MutationObserver(() => {
         chevron.style.transform = panel.style.display === 'none' ? '' : 'rotate(90deg)';
       });
       observer.observe(panel, { attributes: true, attributeFilter: ['style'] });
     }
   });
+
+  // Show floating AI chat assistant
+  showChatBubble();
+}
+
+// ─────────────────────────────────────────────────────────
+// AI CHAT ASSISTANT
+// ─────────────────────────────────────────────────────────
+function showChatBubble() {
+  document.getElementById('csi-chat-bubble')?.remove();
+  document.getElementById('csi-chat-panel')?.remove();
+
+  const analysisCtx = state.currentAnalysis;
+  const bubble = document.createElement('div');
+  bubble.id = 'csi-chat-bubble';
+  bubble.innerHTML = `<div onclick="toggleChatPanel()" style="
+    position:fixed;bottom:28px;right:28px;z-index:9999;
+    width:56px;height:56px;border-radius:50%;
+    background:linear-gradient(135deg,#0f2d5a,#1e4a8a);
+    box-shadow:0 4px 20px rgba(15,45,90,.4);
+    display:flex;align-items:center;justify-content:center;
+    cursor:pointer;transition:transform .2s,box-shadow .2s;
+    animation:chatBubblePop .4s cubic-bezier(.34,1.56,.64,1)"
+    onmouseover="this.style.transform='scale(1.1)'"
+    onmouseout="this.style.transform=''">
+    <svg width="24" height="24" fill="none" stroke="white" stroke-width="2" viewBox="0 0 24 24">
+      <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+    </svg>
+    <span style="position:absolute;top:-3px;right:-3px;width:18px;height:18px;
+      background:#c8a846;border-radius:50%;border:2px solid white;
+      display:flex;align-items:center;justify-content:center;
+      font-size:9px;font-weight:800;color:#0f2d5a;font-family:Outfit">AI</span>
+  </div>`;
+  document.body.appendChild(bubble);
+
+  const panel = document.createElement('div');
+  panel.id = 'csi-chat-panel';
+  panel.style.cssText = `
+    position:fixed;bottom:96px;right:28px;z-index:9998;width:380px;
+    background:white;border-radius:16px;display:none;flex-direction:column;
+    box-shadow:0 8px 40px rgba(15,45,90,.2);border:1px solid #e4e8f0;overflow:hidden`;
+  panel.innerHTML = `
+    <div style="background:linear-gradient(135deg,#0f2d5a,#1e4a8a);padding:14px 18px;flex-shrink:0">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="width:36px;height:36px;background:rgba(255,255,255,.15);border-radius:10px;
+          display:flex;align-items:center;justify-content:center;flex-shrink:0">
+          <svg width="18" height="18" fill="none" stroke="white" stroke-width="2" viewBox="0 0 24 24">
+            <path d="M13 10V3L4 14h7v7l9-11h-7z"/>
+          </svg>
+        </div>
+        <div style="flex:1">
+          <div style="font-family:Outfit;font-weight:700;font-size:14px;color:white">CSI Analyst AI</div>
+          <div style="font-size:11px;color:rgba(255,255,255,.65)">
+            ${analysisCtx?.company_name || 'Analysis'} · ${analysisCtx?.analysis?.risk_level || '?'} Risk ·
+            ${(analysisCtx?.analysis?.incident_log || []).length} incidents
+          </div>
+        </div>
+        <button onclick="toggleChatPanel()" style="background:rgba(255,255,255,.15);border:none;
+          color:white;width:28px;height:28px;border-radius:8px;cursor:pointer;
+          display:flex;align-items:center;justify-content:center">
+          <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+            <path d="M18 6L6 18M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div id="chat-suggestions" style="padding:10px 14px;border-bottom:1px solid #f1f5f9;flex-shrink:0;background:#fafbfc">
+      <div style="font-size:10px;color:#94a3b8;margin-bottom:6px;font-weight:700;text-transform:uppercase;letter-spacing:.5px">Quick questions</div>
+      <div style="display:flex;flex-wrap:wrap;gap:5px">
+        ${['Explain incident #1', 'Why High risk?', 'What to fix first?',
+           'Remove incident #2 — incorrect', 'What are the penalties?'].map(s => `
+          <button onclick="useChatSuggestion('${s}')" style="background:#f0f4ff;border:1px solid #e4e8f0;
+            color:#0f2d5a;font-size:11px;padding:3px 10px;border-radius:20px;cursor:pointer;font-family:DM Sans"
+            onmouseover="this.style.background='#dbeafe'" onmouseout="this.style.background='#f0f4ff'">${s}</button>`
+        ).join('')}
+      </div>
+    </div>
+
+    <div id="chat-messages" style="flex:1;overflow-y:auto;padding:14px;
+      display:flex;flex-direction:column;gap:10px;min-height:160px;max-height:240px">
+      <div style="background:#f8fafc;border-radius:10px;padding:12px 14px;
+        font-size:12.5px;color:#475569;line-height:1.5">
+        👋 I have full context of this analysis. Ask me to <strong>explain</strong> any incident,
+        <strong>verify</strong> a finding, or <strong>correct</strong> anything that looks wrong —
+        changes apply live to the analysis above.
+      </div>
+    </div>
+
+    <div style="padding:12px 14px;border-top:1px solid #e4e8f0;flex-shrink:0;background:#fafbfc">
+      <div style="display:flex;gap:8px;align-items:flex-end">
+        <textarea id="chat-input" placeholder="Ask about any incident, or say 'remove incident #2'..."
+          onkeydown="chatKeyDown(event)"
+          style="flex:1;border:1.5px solid #e4e8f0;border-radius:10px;padding:8px 12px;
+            font-family:DM Sans;font-size:12.5px;resize:none;min-height:38px;max-height:90px;
+            outline:none;color:#1a2540;line-height:1.4"
+          onfocus="this.style.borderColor='#0f2d5a'" onblur="this.style.borderColor='#e4e8f0'"></textarea>
+        <button id="chat-send-btn" onclick="sendChatMessage()" style="width:38px;height:38px;
+          background:#0f2d5a;border:none;border-radius:10px;cursor:pointer;flex-shrink:0;
+          display:flex;align-items:center;justify-content:center"
+          onmouseover="this.style.background='#1e4a8a'" onmouseout="this.style.background='#0f2d5a'">
+          <svg width="16" height="16" fill="none" stroke="white" stroke-width="2" viewBox="0 0 24 24">
+            <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+          </svg>
+        </button>
+      </div>
+      <div style="font-size:10px;color:#94a3b8;margin-top:5px;text-align:center">
+        Changes apply live to the analysis • Shift+Enter for new line
+      </div>
+    </div>`;
+  document.body.appendChild(panel);
+}
+
+function toggleChatPanel() {
+  const panel = document.getElementById('csi-chat-panel');
+  if (!panel) return;
+  const isOpen = panel.style.display === 'flex';
+  panel.style.display = isOpen ? 'none' : 'flex';
+  panel.style.flexDirection = 'column';
+  if (!isOpen) setTimeout(() => document.getElementById('chat-input')?.focus(), 100);
+}
+
+function useChatSuggestion(text) {
+  const input = document.getElementById('chat-input');
+  if (input) { input.value = text; input.focus(); }
+  document.getElementById('chat-suggestions').style.display = 'none';
+}
+
+function chatKeyDown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChatMessage(); }
+}
+
+async function sendChatMessage() {
+  const input  = document.getElementById('chat-input');
+  const msgBox = document.getElementById('chat-messages');
+  const btn    = document.getElementById('chat-send-btn');
+  if (!input || !msgBox) return;
+  const message = input.value.trim();
+  if (!message) return;
+  if (!state.currentAnalysis) { toast('No analysis loaded — run an analysis first', 'error'); return; }
+
+  input.value = '';
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spinner" style="width:14px;height:14px;border-width:2px;border-color:rgba(255,255,255,.3);border-top-color:white"></span>`;
+
+  appendChatMsg('user', message, msgBox);
+  state.chatHistory.push({ role:'user', content:message });
+  const typingEl = appendChatMsg('typing', '', msgBox);
+
+  try {
+    const res = await apiPost('/api/chat', {
+      message,
+      analysis:     state.currentAnalysis.analysis || {},
+      history:      state.chatHistory.slice(-8),
+      company_name: state.currentAnalysis.company_name || '',
+    });
+    typingEl.remove();
+    const botText = res.response || 'I could not generate a response.';
+    appendChatMsg('bot', botText, msgBox, res.action);
+    state.chatHistory.push({ role:'assistant', content:botText });
+    if (res.action) applyAnalysisAction(res.action);
+  } catch (e) {
+    typingEl.remove();
+    appendChatMsg('bot', 'Sorry, error: ' + e.message, msgBox);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = `<svg width="16" height="16" fill="none" stroke="white" stroke-width="2" viewBox="0 0 24 24"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>`;
+  }
+}
+
+function appendChatMsg(role, text, container, action) {
+  const el = document.createElement('div');
+  if (role === 'typing') {
+    el.innerHTML = `<div style="background:#f1f5f9;border-radius:10px;padding:10px 14px;
+      font-size:12px;color:#94a3b8;display:flex;gap:4px;align-items:center">
+      <span style="animation:typingDot 1s .0s infinite both">●</span>
+      <span style="animation:typingDot 1s .2s infinite both">●</span>
+      <span style="animation:typingDot 1s .4s infinite both">●</span></div>`;
+  } else if (role === 'user') {
+    el.innerHTML = `<div style="background:#0f2d5a;color:white;border-radius:10px 10px 2px 10px;
+      padding:10px 14px;font-size:12.5px;line-height:1.5;
+      max-width:88%;margin-left:auto">${esc(text)}</div>`;
+  } else {
+    const formatted = esc(text).replace(/\n•/g,'<br>•').replace(/\n/g,'<br>');
+    let actionBadge = '';
+    if (action) {
+      const labels = {remove_incident:'🗑 Incident removed',update_incident:'✏ Incident updated',
+                      update_risk:'🔄 Risk updated',add_recommendation:'➕ Recommendation added'};
+      actionBadge = `<div style="margin-top:8px;padding:6px 10px;background:#dcfce7;border-radius:6px;
+        font-size:11px;color:#15803d;font-weight:600">${labels[action.type]||'✓ Applied'}
+        ${action.reason?`<div style="font-weight:400;color:#166534;margin-top:2px">${esc(action.reason)}</div>`:''}</div>`;
+    }
+    el.innerHTML = `<div style="background:#f8fafc;border:1px solid #e4e8f0;border-radius:10px 10px 10px 2px;
+      padding:10px 14px;font-size:12.5px;line-height:1.6;color:#334155;max-width:92%">
+      <div style="font-size:10px;color:#94a3b8;font-weight:700;margin-bottom:4px;
+        text-transform:uppercase;letter-spacing:.5px">CSI Analyst AI</div>
+      <div>${formatted}</div>${actionBadge}</div>`;
+  }
+  container.appendChild(el);
+  container.scrollTop = container.scrollHeight;
+  return el;
+}
+
+function applyAnalysisAction(action) {
+  if (!state.currentAnalysis || !action) return;
+  const a   = state.currentAnalysis.analysis;
+  const log = a.incident_log || a.non_compliance_findings || [];
+
+  if (action.type === 'remove_incident') {
+    const idx = (action.incident_id || 1) - 1;
+    if (log[idx]) { log.splice(idx, 1); a.total_incidents = log.length; }
+    toast(`Incident #${action.incident_id} removed`, 'success');
+  } else if (action.type === 'update_incident') {
+    const idx = (action.incident_id || 1) - 1;
+    if (log[idx] && action.changes) Object.assign(log[idx], action.changes);
+    toast(`Incident #${action.incident_id} updated`, 'success');
+  } else if (action.type === 'update_risk') {
+    if (action.changes?.risk_level)     a.risk_level    = action.changes.risk_level;
+    if (action.changes?.overall_score !== undefined) a.overall_score = action.changes.overall_score;
+    if (action.changes?.risk_summary)   a.risk_summary  = action.changes.risk_summary;
+    toast('Risk assessment updated', 'success');
+  } else if (action.type === 'add_recommendation') {
+    if (!a.recommendations) a.recommendations = [];
+    a.recommendations.unshift(action.changes);
+    toast('Recommendation added', 'success');
+  }
+
+  // Re-render keeping chat panel state
+  const chatOpen = document.getElementById('csi-chat-panel')?.style.display === 'flex';
+  const chatHistory = [...(state.chatHistory || [])];
+  renderAnalysis(state.currentAnalysis);
+  state.chatHistory = chatHistory;
+  if (chatOpen) setTimeout(() => {
+    const p = document.getElementById('csi-chat-panel');
+    if (p) { p.style.display = 'flex'; p.style.flexDirection = 'column'; }
+  }, 80);
 }
 
 // ─────────────────────────────────────────────────────────
